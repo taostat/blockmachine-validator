@@ -96,25 +96,6 @@ async def main():
         hotkey=hotkey,
     )
 
-    # prices
-    price_netuid = config.weights.price_netuid or config.netuid
-    price_subtensor = chain.get_subtensor()
-
-    if config.weights.price_network and config.weights.price_network != config.network:
-        try:
-            price_subtensor = bt.Subtensor(network=config.weights.price_network)
-            logger.info(
-                f"Using separate subtensor for prices: {config.weights.price_network}"
-            )
-        except Exception as e:
-            logger.warning(f"Could not create price subtensor: {e}, using validator's")
-
-    prices = AlphaPriceFetcher(
-        subtensor=price_subtensor,
-        netuid=price_netuid,
-        tao_price_api=config.weights.tao_price_api,
-    )
-
     # shared auth — single TokenProvider for all registry/gateway interactions
     gw_auth = config.verification_gateway
     token_provider = TokenProvider(
@@ -142,6 +123,25 @@ async def main():
         )
     finally:
         await registry_config_client.close()
+
+    # prices — built after registry overlay so weights.price_* take effect
+    price_netuid = config.weights.price_netuid or config.netuid
+    price_subtensor = chain.get_subtensor()
+
+    if config.weights.price_network and config.weights.price_network != config.network:
+        try:
+            price_subtensor = bt.Subtensor(network=config.weights.price_network)
+            logger.info(
+                f"Using separate subtensor for prices: {config.weights.price_network}"
+            )
+        except Exception as e:
+            logger.warning(f"Could not create price subtensor: {e}, using validator's")
+
+    prices = AlphaPriceFetcher(
+        subtensor=price_subtensor,
+        netuid=price_netuid,
+        tao_price_api=config.weights.tao_price_api,
+    )
 
     # registry client (epochs, miner configs, S3 log fetching)
     logs = LogsClient(
