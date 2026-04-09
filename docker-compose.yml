@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${LOCAL_DB_NAME:-blockmachine_validator}
+      POSTGRES_USER: ${LOCAL_DB_USER:-validator}
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:?LOCAL_DB_PASSWORD is required}
+    volumes:
+      - validator_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LOCAL_DB_USER:-validator} -d ${LOCAL_DB_NAME:-blockmachine_validator}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - validator-net
+
+  validator:
+    build:
+      context: ..
+      dockerfile: validator/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CONFIG_PATH: ${CONFIG_PATH:-}
+
+      NETUID: ${NETUID:-19}
+      SUBTENSOR_NETWORK: ${SUBTENSOR_NETWORK:-finney}
+      REGISTRY_URL: ${REGISTRY_URL:-}
+
+      WALLET_NAME: ${WALLET_NAME:-validator}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      WALLET_HOTKEY_SEED: ${WALLET_HOTKEY_SEED:-}
+
+      LOCAL_DB_HOST: db
+      LOCAL_DB_PORT: 5432
+      LOCAL_DB_NAME: ${LOCAL_DB_NAME:-blockmachine_validator}
+      LOCAL_DB_USER: ${LOCAL_DB_USER:-validator}
+      LOCAL_DB_PASSWORD: ${LOCAL_DB_PASSWORD}
+      DB_RETENTION_DAYS: ${DB_RETENTION_DAYS:-30}
+
+      METRICS_PORT: ${METRICS_PORT:-9090}
+    volumes:
+      - ${BITTENSOR_PATH:-~/.bittensor}:/root/.bittensor:ro
+    networks:
+      - validator-net
+
+volumes:
+  validator_db:
+
+networks:
+  validator-net:
