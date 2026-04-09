@@ -18,8 +18,8 @@ services:
 
   validator:
     build:
-      context: ..
-      dockerfile: validator/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       db:
