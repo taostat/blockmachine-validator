@@ -1,8 +1,8 @@
-# BlockMachine Validator Guide
+# Blockmachine Validator Guide
 
 ## Overview
 
-BlockMachine (Subnet 19) is a decentralized marketplace for blockchain RPC infrastructure. Validators independently audit miner performance by reading gateway logs from public storage, verifying response correctness against reference nodes, computing quality-weighted scores, and submitting weights on-chain each epoch (361 blocks, ~72 minutes).
+Blockmachine (Subnet 19) is a decentralized marketplace for blockchain RPC infrastructure. Validators independently audit miner performance by reading gateway logs from public storage, verifying response correctness against reference nodes, computing quality-weighted scores, and submitting weights on-chain each epoch (361 blocks, ~72 minutes).
 
 ---
 
