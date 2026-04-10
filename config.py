@@ -67,8 +67,8 @@ class ReferenceNodesConfig:
 class VerificationGatewayConfig:
     # All values are provided by the registry.
     url: str = ""
-    auth_url: str = ""
-    client_id: str = ""
+    auth_url: str = "https://test-auth.taostats.io"
+    client_id: str = "07f5c729-5ca7-412a-b5e7-4966e132548e"
 
 
 @dataclass
@@ -196,6 +196,10 @@ def _apply_env(config: ValidatorConfig):
     # override for bootstrap (the validator must talk to a chain before it
     # can authenticate to the registry).
     _env_str(config, "network", "SUBTENSOR_NETWORK")
+
+    gw = config.verification_gateway
+    _env_str(gw, "auth_url", "GATEWAY_AUTH_URL")
+    _env_str(gw, "client_id", "GATEWAY_CLIENT_ID")
 
     db = config.database
     _env_bool(db, "enabled", "DB_ENABLED")
