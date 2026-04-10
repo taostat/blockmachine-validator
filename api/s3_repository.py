@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 import boto3
+from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
@@ -44,23 +45,50 @@ class S3Repository:
             f"prefix={self._s3_prefix or '(none)'}"
         )
 
+    _ADDRESSING_STYLES = ("virtual", "path", "auto")
+
+    def _build_client(self, signature_version, addressing_style: str):
+        has_creds = signature_version != UNSIGNED
+        return boto3.client(
+            "s3",
+            endpoint_url=self._endpoint_url,
+            region_name=self.s3_config.region,
+            aws_access_key_id=self.s3_config.access_key_id if has_creds else None,
+            aws_secret_access_key=self.s3_config.secret_access_key if has_creds else None,
+            config=Config(
+                signature_version=signature_version,
+                s3={"addressing_style": addressing_style},
+            ),
+        )
+
     def _get_s3(self):
         if self._s3_client is None:
-            self._s3_client = boto3.client(
-                "s3",
-                endpoint_url=self._endpoint_url,
-                region_name=self.s3_config.region,
-                aws_access_key_id=self.s3_config.access_key_id,
-                aws_secret_access_key=self.s3_config.secret_access_key,
-                config=Config(
-                    signature_version="s3v4",
-                    s3={
-                        "addressing_style": getattr(
-                            self.s3_config, "addressing_style", "auto"
-                        )
-                    },
-                ),
+            has_creds = (
+                self.s3_config.access_key_id and self.s3_config.secret_access_key
             )
+            sig = "s3v4" if has_creds else UNSIGNED
+            style = getattr(self.s3_config, "addressing_style", "auto")
+            # Try the preferred style first, then fall back through others.
+            styles = [style] + [s for s in self._ADDRESSING_STYLES if s != style]
+            last_err = None
+            for s in styles:
+                client = self._build_client(sig, s)
+                try:
+                    client.list_objects_v2(
+                        Bucket=self._bucket_name, MaxKeys=1
+                    )
+                    logger.info(f"S3 client connected (addressing_style={s})")
+                    self._s3_client = client
+                    return self._s3_client
+                except Exception as e:
+                    last_err = e
+                    logger.debug(f"S3 addressing_style={s} failed: {e}")
+            # All styles failed — use first style and let errors surface later
+            logger.warning(
+                f"S3 probe failed for all addressing styles, "
+                f"defaulting to '{styles[0]}': {last_err}"
+            )
+            self._s3_client = self._build_client(sig, styles[0])
         return self._s3_client
 
     @property
