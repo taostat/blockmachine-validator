@@ -73,6 +73,8 @@ The validator fetches network-wide settings (epoch length, scoring, reference no
 | `NETUID` | Subnet UID (19 for mainnet, 417 for testnet) | — |
 | `SUBTENSOR_NETWORK` | Bittensor network (`finney` or `test`) | finney |
 | `REGISTRY_URL` | **Required.** Registry base URL | — |
+| `GATEWAY_AUTH_URL` | Authentication endpoint for challenge-response flow | `https://test-auth.taostats.io` (testnet) |
+| `GATEWAY_CLIENT_ID` | OAuth client ID for gateway auth | `07f5c729-5ca7-412a-b5e7-4966e132548e` |
 | `WALLET_NAME` | Bittensor wallet directory | validator |
 | `WALLET_HOTKEY` | Hotkey name within wallet | default |
 | `WALLET_HOTKEY_SEED` | Opaque hotkey seed string from the wallet file, for headless containers without a mounted `~/.bittensor` | — |
@@ -196,7 +198,7 @@ docker compose up -d
 Yes. Set `DB_ENABLED=false`. Epoch audit history won't be persisted across restarts.
 
 **How do I switch between testnet and mainnet?**
-Use the corresponding `.env.example.*` file. `NETUID`, `SUBTENSOR_NETWORK`, and `REGISTRY_URL` are the only variables that change.
+Use the corresponding `.env.example.*` file. `NETUID`, `SUBTENSOR_NETWORK`, `REGISTRY_URL`, and `GATEWAY_AUTH_URL` are the variables that change between networks.
 
 **What happens if my validator goes down?**
 You miss weight submissions for the epochs you're offline. Prolonged downtime reduces your validator's effective influence.
