@@ -76,6 +76,10 @@ class ValidatorConfig:
     # Per-deployment identity / infra (env vars).
     netuid: int = 19
     network: str = "finney"
+    # Optional explicit chain endpoint (ws://host:port). When set, overrides
+    # the shortname in `network` so validators can point at their own
+    # subtensor node instead of the public OTF endpoint.
+    subtensor_url: Optional[str] = None
     wallet_name: str = "validator"
     wallet_hotkey: str = "default"
     wallet_hotkey_seed: Optional[str] = None
@@ -189,6 +193,7 @@ def _apply_env(config: ValidatorConfig):
     _env_str(config, "wallet_name", "WALLET_NAME")
     _env_str(config, "wallet_hotkey", "WALLET_HOTKEY")
     _env_str(config, "wallet_hotkey_seed", "WALLET_HOTKEY_SEED")
+    _env_str(config, "subtensor_url", "SUBTENSOR_URL")
     _env_str(config, "registry_url", "REGISTRY_URL")
     _env_int(config, "metrics_port", "METRICS_PORT")
 

@@ -91,7 +91,7 @@ async def main():
 
     # chain
     chain = BittensorChain(
-        network=config.network,
+        network=config.subtensor_url or config.network,
         netuid=config.netuid,
         hotkey=hotkey,
     )
