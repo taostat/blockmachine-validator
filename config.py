@@ -67,8 +67,8 @@ class ReferenceNodesConfig:
 class VerificationGatewayConfig:
     # All values are provided by the registry.
     url: str = ""
-    auth_url: str = "https://test-auth.taostats.io"
-    client_id: str = "07f5c729-5ca7-412a-b5e7-4966e132548e"
+    auth_url: str = "https://auth.taostats.io"
+    client_id: str = "35cc50f5-6bf5-432b-8892-84c3b0e856b2"
 
 
 @dataclass

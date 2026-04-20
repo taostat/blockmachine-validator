@@ -73,8 +73,8 @@ The validator fetches network-wide settings (epoch length, scoring, reference no
 | `NETUID` | Subnet UID (19 for mainnet, 417 for testnet) | — |
 | `SUBTENSOR_NETWORK` | Bittensor network (`finney` or `test`) | finney |
 | `REGISTRY_URL` | **Required.** Registry base URL | — |
-| `GATEWAY_AUTH_URL` | Authentication endpoint for challenge-response flow | `https://test-auth.taostats.io` (testnet) |
-| `GATEWAY_CLIENT_ID` | OAuth client ID for gateway auth | `07f5c729-5ca7-412a-b5e7-4966e132548e` |
+| `GATEWAY_AUTH_URL` | Authentication endpoint for challenge-response flow | `https://auth.taostats.io` (mainnet) |
+| `GATEWAY_CLIENT_ID` | OAuth client ID for gateway auth | `35cc50f5-6bf5-432b-8892-84c3b0e856b2` (mainnet) |
 | `WALLET_NAME` | Bittensor wallet directory | validator |
 | `WALLET_HOTKEY` | Hotkey name within wallet | default |
 | `WALLET_HOTKEY_SEED` | Opaque hotkey seed string from the wallet file, for headless containers without a mounted `~/.bittensor` | — |
