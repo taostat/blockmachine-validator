@@ -2,6 +2,8 @@ name: Build and Push
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -14,16 +16,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Determine environment from tag
+      - name: Determine environment from ref
         id: env
         run: |
-          REF="${GITHUB_REF#refs/tags/}"
-          if [[ "$REF" == *-dev ]]; then
-            echo "overlays=testnet" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            REF="${GITHUB_REF#refs/tags/}"
+            if [[ "$REF" == *-dev ]]; then
+              echo "overlays=testnet" >> "$GITHUB_OUTPUT"
+            else
+              echo "overlays=testnet mainnet" >> "$GITHUB_OUTPUT"
+            fi
+            echo "tag=$REF" >> "$GITHUB_OUTPUT"
           else
-            echo "overlays=testnet mainnet" >> "$GITHUB_OUTPUT"
+            # Branch push — deploy to testnet only, tag with commit SHA
+            echo "overlays=testnet" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "tag=$REF" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Quay.io
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
