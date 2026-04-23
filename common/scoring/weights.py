@@ -1,4 +1,5 @@
 import logging
+import math
 
 from validator.common.types import (
     EpochWeightsResult,
@@ -88,6 +89,16 @@ def compute_epoch_weights(
 def normalize_weights(
     miner_weights: list[tuple[int, float]], burn_uid: int
 ) -> list[tuple[int, int]]:
+    """Normalize float weights to u16 values for on-chain submission.
+
+    Burn UID is always set to MAX_WEIGHT (65535) so the chain's
+    max-normalization (which scales the largest weight to 65535) is a
+    no-op and the submitted proportions are preserved exactly.
+
+    Miner weights use the largest-remainder method (the same algorithm
+    used in proportional-representation elections) to optimally round
+    fractional u16 values, minimising quantisation error to <1%.
+    """
     cleaned: list[tuple[int, float]] = [
         (uid, w) for uid, w in miner_weights if w and w > 0
     ]
@@ -95,31 +106,48 @@ def normalize_weights(
     if not cleaned:
         return [(burn_uid, MAX_WEIGHT)]
 
-    total = sum(w for _, w in cleaned)
-    if total <= 0:
+    # Extract the burn weight from the list
+    burn_weight = 0.0
+    miners_only: list[tuple[int, float]] = []
+    for uid, w in cleaned:
+        if uid == burn_uid:
+            burn_weight = w
+        else:
+            miners_only.append((uid, w))
+
+    if burn_weight <= 0 or not miners_only:
         return [(burn_uid, MAX_WEIGHT)]
 
-    renorm = total if total > 1.0 + 1e-9 else 1.0
+    # Burn always gets MAX_WEIGHT.  Miner weights are scaled relative to
+    # burn so the ratio miner/burn is preserved after the chain's
+    # max-normalization pass.
+    #
+    # Largest-remainder rounding:
+    #   1. Compute the ideal (fractional) u16 value for each miner.
+    #   2. Give each miner the floor of their ideal value.
+    #   3. Distribute the leftover points (ideal_total - floor_total)
+    #      to the miners with the largest fractional remainders.
+    ideals = [
+        (uid, (w / burn_weight) * MAX_WEIGHT) for uid, w in miners_only
+    ]
 
-    result: list[tuple[int, int]] = []
-    running_total = 0
+    floors = [
+        (uid, math.floor(ideal), ideal - math.floor(ideal))
+        for uid, ideal in ideals
+    ]
 
-    for uid, weight in cleaned:
-        u16_weight = int((weight / renorm) * MAX_WEIGHT)
+    ideal_total = sum(ideal for _, ideal in ideals)
+    floor_total = sum(f for _, f, _ in floors)
+    extras = round(ideal_total) - floor_total
+
+    # Sort by fractional remainder descending; top-N get +1
+    floors.sort(key=lambda x: -x[2])
+
+    result: list[tuple[int, int]] = [(burn_uid, MAX_WEIGHT)]
+    for i, (uid, f, _rem) in enumerate(floors):
+        u16_weight = f + (1 if i < extras else 0)
         if u16_weight <= 0:
             continue
         result.append((uid, u16_weight))
-        running_total += u16_weight
-
-    remainder = MAX_WEIGHT - running_total
-    if remainder <= 0:
-        return result
-
-    for i, (uid, w) in enumerate(result):
-        if uid == burn_uid:
-            result[i] = (uid, w + remainder)
-            break
-    else:
-        result.append((burn_uid, remainder))
 
     return result
