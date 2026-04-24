@@ -1,4 +1,5 @@
 import logging
+import random
 import time
 from typing import Any, Protocol
 
@@ -22,7 +23,7 @@ class EthereumReferenceClient:
         self.endpoint = endpoint
         self.timeout = timeout_ms / 1000
         self._client = httpx.AsyncClient(timeout=self.timeout)
-        self._request_id = 0
+        self._request_id = random.randint(1, 2**31)
 
     async def close(self):
         await self._client.aclose()
@@ -63,7 +64,7 @@ class SubstrateReferenceClient:
         self.endpoint = endpoint
         self.timeout = timeout_ms / 1000
         self._client = httpx.AsyncClient(timeout=self.timeout)
-        self._request_id = 0
+        self._request_id = random.randint(1, 2**31)
         self._is_ws = endpoint.startswith("ws")
 
     async def close(self):
@@ -118,7 +119,7 @@ class GatewayReferenceClient:
         self._token_provider = token_provider
         self.timeout = timeout_ms / 1000
         self._client = httpx.AsyncClient(timeout=self.timeout)
-        self._request_id = 0
+        self._request_id = random.randint(1, 2**31)
         self._consecutive_auth_failures = 0
         self._auth_give_up_threshold = 10
         self._auth_gave_up_at = 0.0
