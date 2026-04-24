@@ -97,7 +97,7 @@ class LoggedVerifier:
                 )
 
                 if not has_explicit_block_param:
-                    if log.inferred_from_latest:
+                    if log.inferred_from_latest or log.block_number:
                         verifiable_logs.append(log)
                         continue
                     else:
@@ -221,7 +221,9 @@ class LoggedVerifier:
             and params[param_index] is not None
         )
 
-        if needs_block and not has_explicit_block_param and log.inferred_from_latest:
+        if needs_block and not has_explicit_block_param and (
+            log.inferred_from_latest or log.block_number
+        ):
             return await self._verify_with_block_tolerance(log, params, param_index)
 
         return await self._verify_exact(log, params)
