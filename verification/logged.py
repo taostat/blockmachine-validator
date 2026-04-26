@@ -235,7 +235,7 @@ class LoggedVerifier:
                 log.chain, log.method, params
             )
             ref_latency = int((time.time() - ref_start) * 1000)
-            ref_response_hash = hash_response(ref_response)
+            ref_response_hash = hash_response(ref_response, log.method)
             self._consecutive_ref_failures = 0
 
         except Exception as e:
@@ -306,7 +306,7 @@ class LoggedVerifier:
                 )
                 ref_latency = int((time.time() - ref_start) * 1000)
 
-                ref_response_hash = hash_response(ref_response)
+                ref_response_hash = hash_response(ref_response, log.method)
 
                 if hashes_match(log.response_hash, ref_response_hash):
                     return VerificationResult(
