@@ -203,9 +203,28 @@ class EpochAudit:
     miner_details: dict = field(default_factory=dict)
 
 
-def hash_response(response: Any) -> str:
-    serialized = json.dumps(response, separators=(",", ":"), sort_keys=True)
+def hash_response(response: Any, method: str | None = None) -> str:
+    cleaned = _strip_nondeterministic(response, method)
+    serialized = json.dumps(cleaned, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+# Methods whose responses contain fields that vary across nodes.
+# chain_getBlock includes GRANDPA justifications that differ per node.
+_NONDETERMINISTIC_FIELDS: dict[str, list[str]] = {
+    "chain_getBlock": ["justifications"],
+}
+
+
+def _strip_nondeterministic(response: Any, method: str | None) -> Any:
+    if method and method in _NONDETERMINISTIC_FIELDS and isinstance(response, dict):
+        cleaned = {
+            k: v
+            for k, v in response.items()
+            if k not in _NONDETERMINISTIC_FIELDS[method]
+        }
+        return cleaned
+    return response
 
 
 def normalize_hash(hash_value: Optional[str]) -> Optional[str]:

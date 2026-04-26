@@ -5,6 +5,7 @@ import time
 
 import httpx
 
+from validator.api.registry_config import get_validator_version
 from validator.auth import TokenProvider
 
 logger = logging.getLogger(__name__)
@@ -99,7 +100,7 @@ class RegistryBlacklistClient:
     # --- Auth helpers (mirrors GatewayReferenceClient pattern) ---
 
     def _get_headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = {"X-Validator-Version": get_validator_version()}
         if self._token.access_token:
             headers["Authorization"] = f"Bearer {self._token.access_token}"
         return headers
