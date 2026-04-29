@@ -185,10 +185,22 @@ INFO - [verification] epoch 7668894 complete
 
 ## 7. Updating
 
+Manual:
+
 ```bash
-docker compose pull
-docker compose up -d
+git pull
+docker compose up -d --build
 ```
+
+Or run the autoupdate loop in the background — it polls `origin/main`
+and rebuilds when new commits land:
+
+```bash
+./scripts/autoupdate.sh
+```
+
+See [scripts/README.md](scripts/README.md) for systemd / cron setup so
+it survives machine reboots.
 
 ---
 
