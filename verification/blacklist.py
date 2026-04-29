@@ -57,6 +57,10 @@ class BlacklistManager:
             "node_id": result.node_id,
             "source_query_id": result.source_query_id,
             "latency_ref_ms": result.latency_ref_ms,
+            # Debug aids: per-candidate trace from the block-tolerance path.
+            "used_block_tolerance": result.used_block_tolerance,
+            "tolerance_attempts": result.tolerance_attempts,
+            "validator_hotkey": self.validator_hotkey,
         }
 
         serialized = json.dumps(evidence, default=str)
@@ -73,6 +77,9 @@ class BlacklistManager:
                 "ref_response_hash": result.ref_response_hash,
                 "node_id": result.node_id,
                 "source_query_id": result.source_query_id,
+                "used_block_tolerance": result.used_block_tolerance,
+                "tolerance_attempts": result.tolerance_attempts,
+                "validator_hotkey": self.validator_hotkey,
             }
 
         await self.blacklist.ban(

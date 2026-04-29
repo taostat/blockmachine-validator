@@ -58,6 +58,12 @@ class VerificationResult:
     miner_response: Optional[Any] = None
     ref_response: Optional[Any] = None
     error_details: Optional[str] = None
+    # Per-candidate trace from the block-tolerance path (N, N-1, N+1).
+    # Each entry: {"block_number": int, "block_hash": str, "ref_response_hash":
+    # str | None, "matched": bool, "latency_ms": int | None, "error": str | None}
+    tolerance_attempts: Optional[list[dict]] = None
+    # When inferred_from_latest=true, the tolerance code branch ran.
+    used_block_tolerance: bool = False
 
 
 @dataclass

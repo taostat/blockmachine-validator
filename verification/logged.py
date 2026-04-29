@@ -293,12 +293,18 @@ class LoggedVerifier:
         last_ref_hash = None
         last_ref_latency = None
         last_ref_response = None
+        # Per-candidate audit trail for ban evidence and debugging.
+        attempts: list[dict] = []
 
         for n in candidates:
+            attempt: dict = {"block_number": n}
             try:
                 pinned_params = await self._build_pinned_params(
                     log.chain, params, block_param_index, n, block_type
                 )
+                # Capture the resolved block hash if pinning was hash-based.
+                if block_type == BlockParamType.HASH and len(pinned_params) > block_param_index:
+                    attempt["block_hash"] = pinned_params[block_param_index]
 
                 ref_start = time.time()
                 ref_response = await self.reference_manager.query(
@@ -307,8 +313,19 @@ class LoggedVerifier:
                 ref_latency = int((time.time() - ref_start) * 1000)
 
                 ref_response_hash = hash_response(ref_response, log.method)
+                matched = hashes_match(log.response_hash, ref_response_hash)
 
-                if hashes_match(log.response_hash, ref_response_hash):
+                attempt.update(
+                    {
+                        "ref_response_hash": ref_response_hash,
+                        "latency_ms": ref_latency,
+                        "matched": matched,
+                        "error": None,
+                    }
+                )
+                attempts.append(attempt)
+
+                if matched:
                     return VerificationResult(
                         is_correct=True,
                         method=log.method,
@@ -320,6 +337,8 @@ class LoggedVerifier:
                         miner_response_hash=log.response_hash,
                         ref_response_hash=ref_response_hash,
                         latency_ref_ms=ref_latency,
+                        tolerance_attempts=attempts,
+                        used_block_tolerance=True,
                     )
 
                 last_ref_hash = ref_response_hash
@@ -327,6 +346,15 @@ class LoggedVerifier:
                 last_ref_response = ref_response
 
             except Exception as e:
+                attempt.update(
+                    {
+                        "ref_response_hash": None,
+                        "latency_ms": None,
+                        "matched": False,
+                        "error": str(e),
+                    }
+                )
+                attempts.append(attempt)
                 ref_errors.append(f"block {n}: {e}")
                 logger.warning(
                     f"Reference query failed for {log.method} at block {n} "
@@ -356,6 +384,8 @@ class LoggedVerifier:
                 source_query_id=log.id,
                 miner_response_hash=log.response_hash,
                 error_details=f"All reference queries failed: {ref_errors}",
+                tolerance_attempts=attempts,
+                used_block_tolerance=True,
             )
 
         return VerificationResult(
@@ -370,6 +400,8 @@ class LoggedVerifier:
             ref_response_hash=last_ref_hash,
             latency_ref_ms=last_ref_latency,
             ref_response=last_ref_response,
+            tolerance_attempts=attempts,
+            used_block_tolerance=True,
         )
 
     async def _build_pinned_params(
