@@ -108,6 +108,7 @@ async def main():
 
     # fetch network-wide config from the registry (epoch, scoring,
     # reference nodes, S3 log location, CU schedule, …) and overlay it.
+    # The client is kept alive for periodic re-fetches (see _config_refresh_loop).
     registry_config_client = RegistryConfigClient(
         registry_url=config.registry_url,
         token_provider=token_provider,
@@ -121,8 +122,6 @@ async def main():
             f"Failed to fetch validator config from registry: {e} — "
             "using local defaults"
         )
-    finally:
-        await registry_config_client.close()
 
     # prices — built after registry overlay so weights.price_* take effect
     price_netuid = config.weights.price_netuid or config.netuid
@@ -185,6 +184,25 @@ async def main():
         reference_manager=reference_manager,
     )
 
+    # periodic config refresh — keeps the registry's view of our version
+    # current, and picks up any registry-side config tweaks. Hourly cadence
+    # is plenty since these values rarely change.
+    _CONFIG_REFRESH_SEC = 3600
+
+    async def _config_refresh_loop():
+        while True:
+            try:
+                await asyncio.sleep(_CONFIG_REFRESH_SEC)
+                remote_cfg = await registry_config_client.fetch()
+                apply_registry_config(config, remote_cfg)
+                logger.debug("Refreshed validator config from registry")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Config refresh error (non-fatal): {e}")
+
+    config_refresh_task = asyncio.create_task(_config_refresh_loop())
+
     # retention cleanup (only with real DB)
     retention_task = None
     if config.database.enabled and hasattr(store, "run_retention_cleanup"):
@@ -216,11 +234,13 @@ async def main():
         await verification_loop.stop()
         if retention_task:
             retention_task.cancel()
+        config_refresh_task.cancel()
         await prices.close()
         await reference_manager.close()
         await logs.close()
         await blacklist.close()
         await token_provider.close()
+        await registry_config_client.close()
         await store.close()
         stop_event.set()
 
