@@ -346,12 +346,15 @@ class LoggedVerifier:
                 last_ref_response = ref_response
 
             except Exception as e:
+                # Some exceptions (e.g. CancelledError) have empty str(); fall
+                # back to the type name so the audit trail always carries info.
+                err_msg = str(e) or repr(e) or type(e).__name__
                 attempt.update(
                     {
                         "ref_response_hash": None,
                         "latency_ms": None,
                         "matched": False,
-                        "error": str(e),
+                        "error": err_msg,
                     }
                 )
                 attempts.append(attempt)
@@ -362,12 +365,13 @@ class LoggedVerifier:
                 )
                 continue
 
-        if len(ref_errors) == len(candidates):
+        if ref_errors:
             self._consecutive_ref_failures += 1
             if self._consecutive_ref_failures <= 3:
                 logger.warning(
-                    f"All tolerance reference queries failed for {log.method} on "
-                    f"{log.chain}: {ref_errors}. Marking correct to avoid false positive."
+                    f"At least one tolerance reference query failed for "
+                    f"{log.method} on {log.chain}: {ref_errors}. "
+                    f"Marking correct to avoid false positive."
                 )
             elif self._consecutive_ref_failures == 4:
                 logger.warning(
@@ -383,7 +387,7 @@ class LoggedVerifier:
                 node_id=log.node_id,
                 source_query_id=log.id,
                 miner_response_hash=log.response_hash,
-                error_details=f"All reference queries failed: {ref_errors}",
+                error_details=f"Reference queries failed: {ref_errors}",
                 tolerance_attempts=attempts,
                 used_block_tolerance=True,
             )
