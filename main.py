@@ -159,7 +159,7 @@ async def main():
     store = await _create_store(config)
 
     # weight submission
-    submitter = WeightSubmitter(chain, burn_sink_uid=config.weights.burn_sink_uid)
+    submitter = WeightSubmitter(chain, weights_config=config.weights)
 
     # reference nodes for verification
     reference_manager = await _create_reference_manager(config, token_provider)

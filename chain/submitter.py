@@ -1,15 +1,18 @@
 import logging
 
 from validator.common.scoring.weights import normalize_weights
+from validator.config import WeightConfig
 from validator.protocols import ChainInterface
 
 logger = logging.getLogger(__name__)
 
 
 class WeightSubmitter:
-    def __init__(self, chain: ChainInterface, burn_sink_uid: int):
+    def __init__(self, chain: ChainInterface, weights_config: WeightConfig):
         self.chain = chain
-        self.burn_sink_uid = burn_sink_uid
+        # Held by reference so registry-driven hot-reloads of burn_sink_uid
+        # take effect on the next submit() without a process restart.
+        self._weights = weights_config
 
     async def submit(
         self,
@@ -17,11 +20,12 @@ class WeightSubmitter:
         burn_weight: float,
     ) -> bool:
         """Normalize and submit weights to chain. Returns True on success."""
+        burn_sink_uid = self._weights.burn_sink_uid
         all_weights = list(miner_weights)
         if burn_weight > 0:
-            all_weights.append((self.burn_sink_uid, burn_weight))
+            all_weights.append((burn_sink_uid, burn_weight))
 
-        normalized = normalize_weights(all_weights, self.burn_sink_uid)
+        normalized = normalize_weights(all_weights, burn_sink_uid)
 
         if not normalized:
             logger.warning("No weights to submit")
@@ -32,7 +36,7 @@ class WeightSubmitter:
 
         logger.info(f"Submitting weights for {len(uids)} UIDs")
         for uid, w in zip(uids, values):
-            label = " (burn)" if uid == self.burn_sink_uid else ""
+            label = " (burn)" if uid == burn_sink_uid else ""
             logger.info(f"  UID {uid}: {w}{label}")
 
         try:
