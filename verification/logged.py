@@ -14,10 +14,12 @@ import time
 
 from validator.common.types import (
     MinerInfo,
+    NULL_RESPONSE_HASH,
     QueryLog,
     VerificationResult,
     hash_response,
     hashes_match,
+    normalize_hash,
 )
 from validator.config import VerificationConfig
 from validator.metrics import (
@@ -67,12 +69,17 @@ class LoggedVerifier:
         skipped_non_verifiable = 0
         skipped_missing_block_param = 0
         skipped_no_response_hash = 0
+        skipped_null_miner_response = 0
         skipped_unknown_chain = 0
         skipped_non_verifiable_methods: set[str] = set()
 
         for log in miner_logs:
             if log.status_code != 200 or not log.response_hash:
                 skipped_no_response_hash += 1
+                continue
+
+            if normalize_hash(log.response_hash) == NULL_RESPONSE_HASH:
+                skipped_null_miner_response += 1
                 continue
 
             if not log.chain or log.chain.upper() == "UNKNOWN":
@@ -113,6 +120,10 @@ class LoggedVerifier:
 
         if skipped_no_response_hash:
             record_verification_skipped("no_response_hash", skipped_no_response_hash)
+        if skipped_null_miner_response:
+            record_verification_skipped(
+                "null_miner_response", skipped_null_miner_response
+            )
         if skipped_non_verifiable:
             record_verification_skipped("non_verifiable_method", skipped_non_verifiable)
         if skipped_missing_block_param:
@@ -135,7 +146,8 @@ class LoggedVerifier:
             f"{len(verifiable_logs)} verifiable, "
             f"{skipped_non_verifiable} non-verifiable{non_verifiable_detail}, "
             f"{skipped_missing_block_param} missing block params, "
-            f"{skipped_no_response_hash} no response hash"
+            f"{skipped_no_response_hash} no response hash, "
+            f"{skipped_null_miner_response} null miner response"
         )
 
         if not verifiable_logs:
@@ -221,8 +233,10 @@ class LoggedVerifier:
             and params[param_index] is not None
         )
 
-        if needs_block and not has_explicit_block_param and (
-            log.inferred_from_latest or log.block_number
+        if (
+            needs_block
+            and not has_explicit_block_param
+            and (log.inferred_from_latest or log.block_number)
         ):
             return await self._verify_with_block_tolerance(log, params, param_index)
 
@@ -303,7 +317,10 @@ class LoggedVerifier:
                     log.chain, params, block_param_index, n, block_type
                 )
                 # Capture the resolved block hash if pinning was hash-based.
-                if block_type == BlockParamType.HASH and len(pinned_params) > block_param_index:
+                if (
+                    block_type == BlockParamType.HASH
+                    and len(pinned_params) > block_param_index
+                ):
                     attempt["block_hash"] = pinned_params[block_param_index]
 
                 ref_start = time.time()
