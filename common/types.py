@@ -233,6 +233,9 @@ def _strip_nondeterministic(response: Any, method: str | None) -> Any:
     return response
 
 
+NULL_RESPONSE_HASH = hash_response(None)
+
+
 def normalize_hash(hash_value: Optional[str]) -> Optional[str]:
     if not hash_value:
         return None
