@@ -86,8 +86,13 @@ The validator fetches network-wide settings (epoch length, scoring, reference no
 | `LOCAL_DB_PASSWORD` | Postgres password | — |
 | `DB_RETENTION_DAYS` | Days to keep audit rows | 30 |
 | `METRICS_PORT` | Prometheus metrics port | 9090 |
+| `REFERENCE_TAO_URL` | Override the registry-provided TAO reference RPC endpoint | — |
+| `REFERENCE_ETH_URL` | Override the registry-provided ETH reference RPC endpoint | — |
+| `REFERENCE_BSC_URL` | Override the registry-provided BSC reference RPC endpoint | — |
 
 Everything else — reference nodes, burn sink, S3 bucket, verification gateway — is served by the registry and automatically applied at startup. The validator signs a challenge with its hotkey to authenticate against the registry; no manual tokens to manage.
+
+The `REFERENCE_*_URL` overrides are an escape hatch: if a registry-provided reference endpoint is degraded, pin a known-good local archive node and the validator will use it instead.
 
 ### 3.2 Example env files
 

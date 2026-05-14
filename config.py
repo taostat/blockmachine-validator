@@ -127,6 +127,10 @@ def apply_registry_config(config: ValidatorConfig, data: dict) -> None:
     _apply_sub(config.reference_nodes, data.get("reference_nodes", {}))
     _apply_sub(config.verification_gateway, data.get("verification_gateway", {}))
 
+    _env_str(config.reference_nodes, "tao", "REFERENCE_TAO_URL")
+    _env_str(config.reference_nodes, "eth", "REFERENCE_ETH_URL")
+    _env_str(config.reference_nodes, "bsc", "REFERENCE_BSC_URL")
+
     # S3 location only — credentials are not in the registry payload.
     s3 = data.get("s3", {}) or {}
     for k in (

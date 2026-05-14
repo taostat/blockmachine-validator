@@ -215,7 +215,10 @@ class LogsClient:
                 id=log_id,
                 timestamp=timestamp,
                 epoch_id=epoch_id,
-                chain=entry.get("chain", "ETH"),
+                # Default to "UNKNOWN" — the verifier skips these so a missing
+                # chain field can't accidentally route a log to the wrong
+                # reference and trigger a false-positive ban.
+                chain=entry.get("chain", "UNKNOWN"),
                 method=entry.get("method", "unknown"),
                 block_number=entry.get("block_number"),
                 params=params,
