@@ -37,6 +37,9 @@ from validator.verification.method_registry import (
 
 logger = logging.getLogger(__name__)
 
+_EVM_RELATIVE_BLOCK_TAGS = {"latest", "pending", "safe", "finalized"}
+_EVM_UNPINNABLE_BLOCK_TAGS = {"pending", "safe", "finalized"}
+
 
 class LoggedVerifier:
     """
@@ -99,9 +102,8 @@ class LoggedVerifier:
             if needs_block:
                 params = self._extract_params(log)
 
-                has_explicit_block_param = (
-                    param_index < len(params) and params[param_index] is not None
-                )
+                block_param = self._get_block_param(params, param_index)
+                has_explicit_block_param = block_param is not None
 
                 if not has_explicit_block_param:
                     if log.inferred_from_latest or log.block_number:
@@ -115,6 +117,10 @@ class LoggedVerifier:
                         )
                         skipped_missing_block_param += 1
                         continue
+
+                if self._is_unpinnable_evm_block_tag(log.chain, block_param):
+                    skipped_missing_block_param += 1
+                    continue
 
             verifiable_logs.append(log)
 
@@ -227,15 +233,15 @@ class LoggedVerifier:
 
         needs_block, _, param_index = requires_block_param(log.chain, log.method)
 
-        has_explicit_block_param = (
-            needs_block
-            and param_index < len(params)
-            and params[param_index] is not None
-        )
+        block_param = self._get_block_param(params, param_index) if needs_block else None
+        has_explicit_block_param = block_param is not None
 
         if (
             needs_block
-            and not has_explicit_block_param
+            and (
+                not has_explicit_block_param
+                or self._is_latest_evm_block_tag(log.chain, block_param)
+            )
             and (log.inferred_from_latest or log.block_number)
         ):
             return await self._verify_with_block_tolerance(log, params, param_index)
@@ -451,3 +457,25 @@ class LoggedVerifier:
 
         params[block_param_index] = block_value
         return params
+
+    def _get_block_param(self, params: list, block_param_index: int):
+        if block_param_index < 0 or block_param_index >= len(params):
+            return None
+        return params[block_param_index]
+
+    def _is_latest_evm_block_tag(self, chain: str, block_param) -> bool:
+        return (
+            self._is_evm_chain(chain)
+            and isinstance(block_param, str)
+            and block_param.lower() == "latest"
+        )
+
+    def _is_unpinnable_evm_block_tag(self, chain: str, block_param) -> bool:
+        return (
+            self._is_evm_chain(chain)
+            and isinstance(block_param, str)
+            and block_param.lower() in _EVM_UNPINNABLE_BLOCK_TAGS
+        )
+
+    def _is_evm_chain(self, chain: str) -> bool:
+        return chain.upper() in {"ETH", "BSC"}

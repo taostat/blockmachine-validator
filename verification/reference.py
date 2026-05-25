@@ -1,7 +1,9 @@
+import asyncio
+import json
 import logging
 import random
 import time
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 import httpx
 
@@ -11,6 +13,9 @@ from validator.config import ReferenceNodesConfig
 
 logger = logging.getLogger(__name__)
 
+# Trace responses for full ETH blocks can be tens of MB.
+_WS_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
 
 class ReferenceClient(Protocol):
     async def get_block_number(self) -> int: ...
@@ -19,20 +24,52 @@ class ReferenceClient(Protocol):
 
 
 class EthereumReferenceClient:
+    """JSON-RPC client for ETH-family chains.
+
+    Supports both HTTP and WebSocket endpoints — scheme is detected from
+    the URL. The WS path holds a single persistent connection and
+    correlates responses to requests by JSON-RPC id.
+    """
+
     def __init__(self, endpoint: str, timeout_ms: int = 10000):
         self.endpoint = endpoint
         self.timeout = timeout_ms / 1000
-        self._client = httpx.AsyncClient(timeout=self.timeout)
         self._request_id = random.randint(1, 2**31)
+        self._is_ws = endpoint.startswith(("ws://", "wss://"))
+
+        self._ws = None
+        self._ws_lock = asyncio.Lock()
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task: Optional[asyncio.Task] = None
+        self._ws_headers: dict[str, str] = {}
+
+        self._client = httpx.AsyncClient(timeout=self.timeout)
 
     async def close(self):
         await self._client.aclose()
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("client closed"))
+        self._pending.clear()
 
     def _next_id(self) -> int:
         self._request_id += 1
         return self._request_id
 
     async def query(self, method: str, params: list) -> Any:
+        if self._is_ws:
+            return await self._ws_query(method, params)
+        return await self._http_query(method, params)
+
+    async def _http_query(self, method: str, params: list) -> Any:
         payload = {
             "jsonrpc": "2.0",
             "method": method,
@@ -44,6 +81,75 @@ class EthereumReferenceClient:
         )
         response.raise_for_status()
         data = response.json()
+        if "error" in data:
+            raise Exception(f"RPC error: {data['error']}")
+        return data.get("result")
+
+    async def _ensure_ws(self):
+        if self._ws is not None:
+            return
+        async with self._ws_lock:
+            if self._ws is not None:
+                return
+            from websockets.asyncio.client import connect as ws_connect
+
+            self._ws = await asyncio.wait_for(
+                ws_connect(
+                    self.endpoint,
+                    additional_headers=self._ws_headers or None,
+                    max_size=_WS_MAX_MESSAGE_BYTES,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ),
+                timeout=self.timeout,
+            )
+            self._reader_task = asyncio.create_task(self._reader_loop())
+
+    async def _reader_loop(self):
+        """Read frames off the WS and route them to pending futures by id."""
+        try:
+            assert self._ws is not None
+            async for msg in self._ws:
+                try:
+                    data = json.loads(msg)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg_id = data.get("id")
+                if msg_id is None:
+                    # Subscription notification — we don't subscribe, ignore
+                    continue
+                fut = self._pending.pop(msg_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"WS reader loop exited: {type(e).__name__}: {e}")
+        finally:
+            # Drop the connection so the next query reconnects
+            self._ws = None
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("WS connection closed"))
+            self._pending.clear()
+
+    async def _ws_query(self, method: str, params: list) -> Any:
+        await self._ensure_ws()
+        assert self._ws is not None
+        req_id = self._next_id()
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": req_id,
+        }
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+        try:
+            await self._ws.send(json.dumps(payload))
+            data = await asyncio.wait_for(fut, timeout=self.timeout)
+        finally:
+            self._pending.pop(req_id, None)
         if "error" in data:
             raise Exception(f"RPC error: {data['error']}")
         return data.get("result")
