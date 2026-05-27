@@ -170,7 +170,7 @@
       "eth_getHeaderByHash": { "verifiable": false },
       "eth_getHeaderByNumber": { "verifiable": false },
       "eth_getLogs": { "verifiable": false },
-      "eth_getProof": { "verifiable": true, "block_param_index": 2, "block_param_type": "hex_number" },
+      "eth_getProof": { "verifiable": false },
       "eth_getRawTransactionByBlockHashAndIndex": { "verifiable": false },
       "eth_getRawTransactionByBlockNumberAndIndex": { "verifiable": false },
       "eth_getRawTransactionByHash": { "verifiable": false },

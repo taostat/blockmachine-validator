@@ -103,6 +103,9 @@ async def test_eth_pending_block_tag_is_skipped():
 
 
 def test_eth_method_registry_rollout_safety():
-    assert is_verifiable(Chain.ETH.value, "eth_getProof")
+    # eth_getProof is non-verifiable until MPT-based proof verification lands;
+    # reth and erigon return semantically-equivalent but byte-distinct proofs,
+    # so hash-equality against a single reference client would false-ban miners.
+    assert not is_verifiable(Chain.ETH.value, "eth_getProof")
     assert not is_verifiable(Chain.ETH.value, "eth_getTransactionByHash")
     assert not is_verifiable(Chain.ETH.value, "eth_getTransactionReceipt")
