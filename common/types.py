@@ -40,6 +40,10 @@ class QueryLog:
     latency_ms: int
     target_usd_per_cu: Optional[float] = None
     inferred_from_latest: Optional[bool] = None
+    # Set by the gateway when block_number was inferred for a "latest" read
+    # it could not pin to a concrete block. The number is racy, so logged-
+    # query verification must skip it rather than ban on a stale ±1 window.
+    verify_skip: bool = False
 
 
 @dataclass

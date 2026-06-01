@@ -231,6 +231,27 @@ class LoggedVerifier:
     async def _verify_logged_query(self, log: QueryLog) -> VerificationResult:
         params = self._extract_params(log)
 
+        # Defense in depth (RCA §6.2): the gateway marks "latest" reads it
+        # could not pin to a concrete block. Their logged block_number is a
+        # racy per-backend height, so the ±1 tolerance window below can
+        # miss the block the miner actually answered and false-ban a
+        # correctly-behaving (typically the freshest) miner. Skip
+        # verification for these rather than ban on a number we know is
+        # unreliable.
+        if log.verify_skip:
+            record_verification_skipped("unpinned_latest")
+            return VerificationResult(
+                is_correct=True,
+                method=log.method,
+                params=params,
+                block_number=log.block_number,
+                chain=log.chain,
+                node_id=log.node_id,
+                source_query_id=log.id,
+                miner_response_hash=log.response_hash,
+                error_details="skipped: gateway could not pin latest read",
+            )
+
         needs_block, _, param_index = requires_block_param(log.chain, log.method)
 
         block_param = self._get_block_param(params, param_index) if needs_block else None
