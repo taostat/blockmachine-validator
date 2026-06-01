@@ -109,3 +109,36 @@ def test_eth_method_registry_rollout_safety():
     assert not is_verifiable(Chain.ETH.value, "eth_getProof")
     assert not is_verifiable(Chain.ETH.value, "eth_getTransactionByHash")
     assert not is_verifiable(Chain.ETH.value, "eth_getTransactionReceipt")
+
+
+@pytest.mark.asyncio
+async def test_verify_skip_bypasses_block_tolerance():
+    # RCA §6.2: a "latest" read the gateway could not pin is flagged
+    # `verify_skip`. It must NOT enter the ±1 block-tolerance path — that
+    # path would false-ban a fresh miner whose block raced ahead of the
+    # racy logged block_number. It short-circuits to correct instead, and
+    # issues no reference query at all.
+    import dataclasses
+
+    ref = DummyReferenceManager()
+    verifier = LoggedVerifier(VerificationConfig(), ref)
+    miner = MinerInfo(uid=0, hotkey="miner-hotkey", coldkey="miner-coldkey")
+
+    # Same shape as test_eth_latest_block_tag_uses_logged_block_tolerance,
+    # which is known to enter the tolerance path — only verify_skip differs.
+    base = _log(
+        "eth_getBalance",
+        ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "latest"],
+        "sha256:irrelevant-the-entry-is-skipped",
+        block_number=100,
+    )
+    skip_log = dataclasses.replace(
+        base, inferred_from_latest=True, verify_skip=True
+    )
+
+    results = await verifier.verify(miner, [skip_log], sample_pct=1.0, max_samples=1)
+
+    assert len(results) == 1
+    assert results[0].is_correct
+    # Neither the exact nor the tolerance reference query ran.
+    assert ref.queries == []

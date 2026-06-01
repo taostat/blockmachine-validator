@@ -231,6 +231,7 @@ class LogsClient:
                 latency_ms=entry.get("latency_ms", 0),
                 target_usd_per_cu=target_usd_per_cu,
                 inferred_from_latest=entry.get("inferred_from_latest"),
+                verify_skip=entry.get("verify_skip", False),
             )
         except Exception:
             return None
