@@ -12,10 +12,10 @@
   },
   "methods": {
     "TAO": {
-      "chainHead_v1_body": { "verifiable": true, "block_param_index": 1, "block_param_type": "hash" },
-      "chainHead_v1_call": { "verifiable": true, "block_param_index": 1, "block_param_type": "hash" },
-      "chainHead_v1_header": { "verifiable": true, "block_param_index": 1, "block_param_type": "hash" },
-      "chainHead_v1_storage": { "verifiable": true, "block_param_index": 1, "block_param_type": "hash" },
+      "chainHead_v1_body": { "verifiable": false },
+      "chainHead_v1_call": { "verifiable": false },
+      "chainHead_v1_header": { "verifiable": false },
+      "chainHead_v1_storage": { "verifiable": false },
       "chain_getBlock": { "verifiable": true, "block_param_index": 0, "block_param_type": "hash" },
       "chain_getBlockHash": { "verifiable": true, "block_param_index": 0, "block_param_type": "number" },
       "chain_getHead": { "verifiable": true, "block_param_index": 0, "block_param_type": "number" },
