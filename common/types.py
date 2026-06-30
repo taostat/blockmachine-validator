@@ -137,10 +137,6 @@ class MinerEpochData:
     cu_non_archive: int = 0
     price_archive: float = 0.0
     price_non_archive: float = 0.0
-    # Free-tier (API-key-less) portion of the CU above. Free tier is lite-only,
-    # so cu_free_tier_archive should be 0 (FREE_TIER_SPEC T5).
-    cu_free_tier_non_archive: int = 0
-    cu_free_tier_archive: int = 0
 
 
 @dataclass
@@ -153,11 +149,6 @@ class MinerWeight:
     payout_usd: float = 0.0
     payout_alpha: float = 0.0
     weight: float = 0.0
-    # Free-tier portion of consumed_usd / payout_alpha. payout_alpha is the
-    # miner's post-pool-scaling emitted alpha; the free-tier share is the part
-    # the registry caps against conviction (FREE_TIER_SPEC T5).
-    free_tier_consumed_usd: float = 0.0
-    free_tier_payout_alpha: float = 0.0
 
 
 @dataclass

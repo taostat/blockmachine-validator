@@ -97,30 +97,16 @@ class LogsClient:
         for alloc in data.get("allocations", []):
             hk = alloc["miner_hotkey"]
             if hk not in totals:
-                totals[hk] = {
-                    "total": 0,
-                    "archive": 0,
-                    "non_archive": 0,
-                    # Free-tier (API-key-less) subset (schema v3+; 0 for v1/v2).
-                    "free_archive": 0,
-                    "free_non_archive": 0,
-                }
+                totals[hk] = {"total": 0, "archive": 0, "non_archive": 0}
 
             if schema_version >= 2:
                 for entry in alloc.get("request_type_cus", []):
                     cu = entry.get("cu", 0)
                     totals[hk]["total"] += cu
-                    is_archive = entry.get("archive", False)
-                    # free_tier present only in schema v3; defaults to False.
-                    is_free = entry.get("free_tier", False)
-                    if is_archive:
+                    if entry.get("archive", False):
                         totals[hk]["archive"] += cu
-                        if is_free:
-                            totals[hk]["free_archive"] += cu
                     else:
                         totals[hk]["non_archive"] += cu
-                        if is_free:
-                            totals[hk]["free_non_archive"] += cu
             else:
                 total = alloc.get("total_cus", 0)
                 totals[hk]["total"] += total
