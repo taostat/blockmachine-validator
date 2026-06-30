@@ -40,14 +40,6 @@ class BlacklistService(Protocol):
     async def close(self) -> None: ...
 
 
-class FreeTierReporter(Protocol):
-    """Reports per-coldkey free-tier incentive to the registry ledger."""
-
-    async def report_free_tier_incentive(
-        self, epoch_id: str, per_coldkey: list[dict]
-    ) -> bool: ...
-
-
 class EpochStore(Protocol):
     """write-only audit log for epoch results"""
 
