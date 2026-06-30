@@ -15,15 +15,18 @@ from validator.protocols import (
     BlacklistService,
     ChainInterface,
     EpochStore,
+    FreeTierReporter,
     LogsSource,
     PriceSource,
 )
+from decimal import Decimal
 from validator.common.scoring.weights import compute_epoch_weights
 from validator.weights.types import normalize_miner_config
 
 logger = logging.getLogger(__name__)
 
 _CU_RETRY_TIMEOUT = 1800  # 30 min
+_ALPHA_BASE_UNITS = 1_000_000_000  # 1 alpha = 1e9 base units
 
 
 class WeightLoop:
@@ -36,6 +39,7 @@ class WeightLoop:
         store: EpochStore,
         prices: PriceSource,
         submitter: WeightSubmitter,
+        free_tier_reporter: FreeTierReporter | None = None,
     ):
         self.config = config
         self.chain = chain
@@ -44,6 +48,10 @@ class WeightLoop:
         self.store = store
         self.prices = prices
         self.submitter = submitter
+        self.free_tier_reporter = free_tier_reporter
+        # Holds in-flight free-tier report tasks so they aren't GC'd; reports are
+        # fire-and-forget so they never block weight submission / epoch discovery.
+        self._free_tier_tasks: set[asyncio.Task] = set()
         self.running = False
         self._cu_retry_start: dict[str, float] = {}
         self._last_submitted_block: int | None = None
@@ -235,6 +243,7 @@ class WeightLoop:
                         await self.store.mark_epoch_processed(
                             older_id, weights_submitted=False
                         )
+                        await self._report_free_tier(older_id)
 
                 return (epoch_id, miner_configs, manifest, price_snapshot)
 
@@ -265,6 +274,7 @@ class WeightLoop:
             if submitted:
                 self._last_submitted_block = await self.chain.get_current_block()
             await self.store.mark_epoch_processed(epoch_id, weights_submitted=submitted)
+            await self._report_free_tier(epoch_id)
             return True
 
         if manifest:
@@ -297,6 +307,7 @@ class WeightLoop:
             if submitted:
                 self._last_submitted_block = await self.chain.get_current_block()
             await self.store.mark_epoch_processed(epoch_id, weights_submitted=submitted)
+            await self._report_free_tier(epoch_id)
             return True
 
         self._cu_retry_start.pop(epoch_id, None)
@@ -363,6 +374,15 @@ class WeightLoop:
             cu_total = cu_data["total"]
             cu_archive = cu_data.get("archive", 0)
             cu_non_archive = cu_data.get("non_archive", 0)
+            cu_free_non_archive = cu_data.get("free_non_archive", 0)
+            cu_free_archive = cu_data.get("free_archive", 0)
+            if cu_free_archive > 0:
+                # Free tier is lite-only — the gateway rejects archive requests
+                # from key-less callers, so this should never happen.
+                logger.warning(
+                    f"Epoch {epoch_id}: miner {hotkey[:20]}... has "
+                    f"{cu_free_archive} free-tier ARCHIVE CU (expected 0)"
+                )
 
             miner_data.append(
                 MinerEpochData(
@@ -375,6 +395,8 @@ class WeightLoop:
                     cu_non_archive=cu_non_archive,
                     price_archive=price_archive,
                     price_non_archive=price_non_archive,
+                    cu_free_tier_non_archive=cu_free_non_archive,
+                    cu_free_tier_archive=cu_free_archive,
                 )
             )
 
@@ -416,6 +438,58 @@ class WeightLoop:
         """direct submission (no retry, used for burn-only)"""
         return await self.submitter.submit(miner_weights, burn_weight)
 
+    @staticmethod
+    def _build_free_tier_report(
+        weights_result: EpochWeightsResult | None,
+        coldkey_map: dict | None,
+    ) -> list[dict]:
+        """Aggregate per-coldkey free-tier emitted alpha into the report payload
+        (integer base-unit strings). Pure; returns [] for empty/burn epochs."""
+        if weights_result is None or coldkey_map is None:
+            return []
+        by_coldkey: dict[str, float] = {}
+        for m in weights_result.miners:
+            if m.free_tier_payout_alpha <= 0:
+                continue
+            coldkey = coldkey_map.get(m.miner_hotkey, "")
+            if not coldkey:
+                continue
+            by_coldkey[coldkey] = by_coldkey.get(coldkey, 0.0) + m.free_tier_payout_alpha
+
+        per_coldkey: list[dict] = []
+        for coldkey, alpha in by_coldkey.items():
+            # Whole alpha -> u64 base units (1 alpha = 1e9), floored so the
+            # ledger can never exceed actually-emitted alpha.
+            base_units = int(Decimal(str(alpha)) * _ALPHA_BASE_UNITS)
+            if base_units > 0:
+                per_coldkey.append(
+                    {"coldkey": coldkey, "incentive_alpha": str(base_units)}
+                )
+        return per_coldkey
+
+    async def _report_free_tier(
+        self,
+        epoch_id: str,
+        weights_result: EpochWeightsResult | None = None,
+        coldkey_map: dict | None = None,
+    ) -> None:
+        """Dispatch a per-coldkey free-tier incentive report for an epoch. Called
+        for EVERY processed epoch (normal, burn, no-CU, skipped) — an empty
+        per_coldkey still marks the epoch received so the eligibility job never
+        stalls (FREE_TIER_SPEC T5).
+
+        Fire-and-forget: the actual POST runs as a background task so it never
+        blocks weight submission or epoch discovery (the registry client retries
+        auth internally and swallows errors). Best-effort delivery."""
+        if self.free_tier_reporter is None:
+            return
+        per_coldkey = self._build_free_tier_report(weights_result, coldkey_map)
+        task = asyncio.create_task(
+            self.free_tier_reporter.report_free_tier_incentive(epoch_id, per_coldkey)
+        )
+        self._free_tier_tasks.add(task)
+        task.add_done_callback(self._free_tier_tasks.discard)
+
     async def _save_audit_and_mark(
         self,
         epoch_id: str,
@@ -454,6 +528,7 @@ class WeightLoop:
                         "payout_usd": m.payout_usd,
                         "weight": m.weight,
                         "banned": m.is_banned,
+                        "free_tier_payout_alpha": m.free_tier_payout_alpha,
                     }
                     for m in weights_result.miners
                 },
@@ -480,6 +555,10 @@ class WeightLoop:
         )
 
         await self.store.mark_epoch_processed(epoch_id, weights_submitted=submitted)
+
+        # Report free-tier incentive after weights are submitted/marked — never
+        # blocks weight submission (FREE_TIER_SPEC T5).
+        await self._report_free_tier(epoch_id, weights_result, coldkey_map)
 
         logger.info(
             f"Epoch {epoch_id} done — "

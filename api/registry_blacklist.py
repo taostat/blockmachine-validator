@@ -85,6 +85,31 @@ class RegistryBlacklistClient:
             logger.error(f"Failed to submit ban for {coldkey[:16]}...: {e}")
             return False
 
+    async def report_free_tier_incentive(
+        self, epoch_id: str, per_coldkey: list[dict]
+    ) -> bool:
+        """Report per-coldkey free-tier incentive for an epoch to the registry
+        ledger (FREE_TIER_SPEC §8.2 / T5).
+
+        Reuses this client's authenticated registry transport. Non-blocking by
+        design: a failure is logged and returns False — it must never abort the
+        weight loop, which has already submitted weights by the time this runs.
+        ``per_coldkey`` may be empty (burn / no-CU / skipped epochs still report
+        so the epoch is marked received and the eligibility job never stalls).
+        """
+        try:
+            await self._authed_request(
+                "POST",
+                f"/epochs/{epoch_id}/free-tier-incentive",
+                json={"per_coldkey": per_coldkey},
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Failed to report free-tier incentive for epoch {epoch_id}: {e}"
+            )
+            return False
+
     async def get_banned_coldkeys(self) -> set[str]:
         """Fetch all banned coldkeys from the registry."""
         try:
