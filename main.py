@@ -173,6 +173,9 @@ async def main():
         store=store,
         prices=prices,
         submitter=submitter,
+        # The registry client is also the free-tier incentive reporter — it
+        # already holds the authenticated registry transport (FREE_TIER_SPEC T5).
+        free_tier_reporter=blacklist,
     )
 
     verification_loop = VerificationLoop(

@@ -33,13 +33,22 @@ def compute_epoch_weights(
     for miner in miners_data:
         if miner.is_blacklisted:
             consumed_usd = 0.0
-        elif miner.cu_archive > 0 or miner.cu_non_archive > 0:
-            consumed_usd = (
-                miner.cu_non_archive * miner.price_non_archive
-                + miner.cu_archive * miner.price_archive
-            )
+            free_tier_consumed_usd = 0.0
         else:
-            consumed_usd = miner.cu_total * miner.target_usd_per_cu
+            if miner.cu_archive > 0 or miner.cu_non_archive > 0:
+                consumed_usd = (
+                    miner.cu_non_archive * miner.price_non_archive
+                    + miner.cu_archive * miner.price_archive
+                )
+            else:
+                consumed_usd = miner.cu_total * miner.target_usd_per_cu
+            # Free-tier consumed USD is priced the same way; it is a subset of
+            # the miner's consumed USD. (Free tier is lite-only, so the archive
+            # term is normally zero — the caller warns if it is not.)
+            free_tier_consumed_usd = (
+                miner.cu_free_tier_non_archive * miner.price_non_archive
+                + miner.cu_free_tier_archive * miner.price_archive
+            )
 
         total_consumed_usd += consumed_usd
         results.append(
@@ -49,6 +58,7 @@ def compute_epoch_weights(
                 target_usd_per_cu=miner.target_usd_per_cu,
                 is_banned=miner.is_blacklisted,
                 consumed_usd=consumed_usd,
+                free_tier_consumed_usd=free_tier_consumed_usd,
             )
         )
 
@@ -60,6 +70,9 @@ def compute_epoch_weights(
     for r in results:
         r.payout_usd = r.consumed_usd * scale
         r.payout_alpha = r.payout_usd / alpha_price_usd
+        # Free-tier emitted alpha = the same post-scaling alpha, apportioned to
+        # the free-tier USD share (0 for banned miners, whose consumed is 0).
+        r.free_tier_payout_alpha = (r.free_tier_consumed_usd * scale) / alpha_price_usd
         total_payout_alpha += r.payout_alpha
 
     burn_alpha = miner_pool_alpha - total_payout_alpha
