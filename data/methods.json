@@ -8,7 +8,8 @@
     "SUBTENSORMODULE": "TAO"
   },
   "inherit": {
-    "BSC": "ETH"
+    "BSC": "ETH",
+    "BASE": "ETH"
   },
   "methods": {
     "TAO": {
