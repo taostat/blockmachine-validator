@@ -373,16 +373,21 @@ class ReferenceNodeManager:
             bsc = GatewayReferenceClient(
                 url, "bsc", self._token_provider, self.timeout_ms
             )
+            base = GatewayReferenceClient(
+                url, "base", self._token_provider, self.timeout_ms
+            )
             logger.info(f"Initialized gateway reference clients via {url}")
         else:
             tao = SubstrateReferenceClient(self.config.tao, self.timeout_ms)
             eth = EthereumReferenceClient(self.config.eth, self.timeout_ms)
             bsc = EthereumReferenceClient(self.config.bsc, self.timeout_ms)
+            base = EthereumReferenceClient(self.config.base, self.timeout_ms)
             logger.info("Initialized direct reference clients")
 
         self._clients[Chain.TAO.value] = tao
         self._clients[Chain.ETH.value] = eth
         self._clients[Chain.BSC.value] = bsc
+        self._clients[Chain.BASE.value] = base
 
         for alias, canonical in CHAIN_ALIASES.items():
             self._clients[alias] = self._clients[canonical]

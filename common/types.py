@@ -13,6 +13,7 @@ class Chain(Enum):
     TAO = "TAO"
     ETH = "ETH"
     BSC = "BSC"
+    BASE = "BASE"
 
 
 @dataclass
