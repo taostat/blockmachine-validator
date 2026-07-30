@@ -356,3 +356,62 @@ class TestGatewayClient401Fallback:
 
         with pytest.raises(httpx.HTTPStatusError):
             await client.query("eth_blockNumber", [])
+
+
+# --- RegistryConfigClient 401 recovery -----------------------------------
+#
+# ensure_authenticated() never re-checks expiry once a token exists, so an
+# expired JWT must be recovered at the call site. Regression for the live
+# incident where a validator's config refreshes 401'd for 27h straight.
+
+
+@pytest.mark.asyncio
+async def test_registry_config_fetch_recovers_from_401():
+    from validator.api.registry_config import RegistryConfigClient
+
+    provider = _make_provider()
+    provider.access_token = "expired-token"
+    provider.refresh = AsyncMock(return_value=True)
+
+    client = RegistryConfigClient("https://registry.example.com", provider)
+
+    calls = []
+
+    async def fake_get(url, headers=None):
+        calls.append(headers["Authorization"])
+        if len(calls) == 1:
+            return httpx.Response(401, request=httpx.Request("GET", url))
+        return httpx.Response(
+            200, json={"epoch_len": 361}, request=httpx.Request("GET", url)
+        )
+
+    client._http.get = fake_get
+
+    result = await client.fetch()
+    assert result == {"epoch_len": 361}
+    assert len(calls) == 2
+    provider.refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_registry_config_fetch_falls_back_to_reauth_and_backoff():
+    from validator.api.registry_config import RegistryConfigClient
+
+    provider = _make_provider()
+    provider.access_token = "expired-token"
+    provider.refresh = AsyncMock(return_value=False)
+    provider.reauthenticate = AsyncMock(return_value=False)
+    provider.set_backoff = lambda s=60.0: setattr(provider, "_backoff_set", s)
+
+    client = RegistryConfigClient("https://registry.example.com", provider)
+
+    async def fake_get(url, headers=None):
+        return httpx.Response(401, request=httpx.Request("GET", url))
+
+    client._http.get = fake_get
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.fetch()
+    provider.refresh.assert_awaited_once()
+    provider.reauthenticate.assert_awaited_once()
+    assert getattr(provider, "_backoff_set", None) == 60.0

@@ -35,11 +35,33 @@ class RegistryConfigClient:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def fetch(self) -> dict:
-        await self._token.ensure_authenticated()
+    def _headers(self) -> dict:
         headers = {"X-Validator-Version": self.version}
         if self._token.access_token:
             headers["Authorization"] = f"Bearer {self._token.access_token}"
-        resp = await self._http.get(f"{self._url}/validator/config", headers=headers)
+        return headers
+
+    async def fetch(self) -> dict:
+        await self._token.ensure_authenticated()
+        resp = await self._http.get(
+            f"{self._url}/validator/config", headers=self._headers()
+        )
+        # 401 recovery, mirroring GatewayReferenceClient / RegistryBlacklist:
+        # ensure_authenticated() never re-checks expiry once a token exists,
+        # so an expired JWT would otherwise 401 every config refresh forever
+        # (observed live: a validator's refreshes failed for 27h until
+        # restart). Refresh — or fall back to a full challenge re-auth — and
+        # retry once.
+        if resp.status_code == 401:
+            logger.info("Registry config token expired, attempting refresh...")
+            refreshed = await self._token.refresh()
+            if not refreshed:
+                refreshed = await self._token.reauthenticate()
+            if refreshed:
+                resp = await self._http.get(
+                    f"{self._url}/validator/config", headers=self._headers()
+                )
+            else:
+                self._token.set_backoff(60.0)
         resp.raise_for_status()
         return resp.json()
