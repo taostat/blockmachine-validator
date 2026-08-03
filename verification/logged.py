@@ -499,4 +499,11 @@ class LoggedVerifier:
         )
 
     def _is_evm_chain(self, chain: str) -> bool:
-        return chain.upper() in {"ETH", "BSC", "BASE"}
+        return chain.upper() in {
+            "ETH",
+            "BSC",
+            "BASE",
+            "POLYGON",
+            "OPTIMISM",
+            "ARBITRUM",
+        }

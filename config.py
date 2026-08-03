@@ -62,6 +62,9 @@ class ReferenceNodesConfig:
     eth: str = ""
     bsc: str = ""
     base: str = ""
+    polygon: str = ""
+    optimism: str = ""
+    arbitrum: str = ""
 
 
 @dataclass
@@ -132,6 +135,9 @@ def apply_registry_config(config: ValidatorConfig, data: dict) -> None:
     _env_str(config.reference_nodes, "eth", "REFERENCE_ETH_URL")
     _env_str(config.reference_nodes, "bsc", "REFERENCE_BSC_URL")
     _env_str(config.reference_nodes, "base", "REFERENCE_BASE_URL")
+    _env_str(config.reference_nodes, "polygon", "REFERENCE_POLYGON_URL")
+    _env_str(config.reference_nodes, "optimism", "REFERENCE_OPTIMISM_URL")
+    _env_str(config.reference_nodes, "arbitrum", "REFERENCE_ARBITRUM_URL")
 
     # S3 location only — credentials are not in the registry payload.
     s3 = data.get("s3", {}) or {}

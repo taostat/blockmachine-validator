@@ -14,6 +14,9 @@ class Chain(Enum):
     ETH = "ETH"
     BSC = "BSC"
     BASE = "BASE"
+    POLYGON = "POLYGON"
+    OPTIMISM = "OPTIMISM"
+    ARBITRUM = "ARBITRUM"
 
 
 @dataclass
