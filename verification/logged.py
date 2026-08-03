@@ -17,7 +17,7 @@ from validator.common.types import (
     NULL_RESPONSE_HASH,
     QueryLog,
     VerificationResult,
-    hash_response,
+    hash_response_variants,
     hashes_match,
     normalize_hash,
 )
@@ -276,7 +276,8 @@ class LoggedVerifier:
                 log.chain, log.method, params
             )
             ref_latency = int((time.time() - ref_start) * 1000)
-            ref_response_hash = hash_response(ref_response, log.method)
+            ref_hash_variants = hash_response_variants(ref_response, log.method)
+            ref_response_hash = ref_hash_variants[0]
             self._consecutive_ref_failures = 0
 
         except Exception as e:
@@ -303,7 +304,9 @@ class LoggedVerifier:
                 error_details=f"Reference query failed: {e}",
             )
 
-        is_correct = hashes_match(log.response_hash, ref_response_hash)
+        is_correct = any(
+            hashes_match(log.response_hash, h) for h in ref_hash_variants
+        )
 
         return VerificationResult(
             is_correct=is_correct,
@@ -356,8 +359,11 @@ class LoggedVerifier:
                 )
                 ref_latency = int((time.time() - ref_start) * 1000)
 
-                ref_response_hash = hash_response(ref_response, log.method)
-                matched = hashes_match(log.response_hash, ref_response_hash)
+                ref_hash_variants = hash_response_variants(ref_response, log.method)
+                ref_response_hash = ref_hash_variants[0]
+                matched = any(
+                    hashes_match(log.response_hash, h) for h in ref_hash_variants
+                )
 
                 attempt.update(
                     {

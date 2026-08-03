@@ -223,22 +223,112 @@ def hash_response(response: Any, method: str | None = None) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
-# Methods whose responses contain fields that vary across nodes.
-# chain_getBlock includes GRANDPA justifications that differ per node.
-_NONDETERMINISTIC_FIELDS: dict[str, list[str]] = {
-    "chain_getBlock": ["justifications"],
+# Methods whose responses contain fields that vary across nodes even when the
+# underlying chain data is identical. Must stay in sync with the gateway's
+# strip_nondeterministic in gateway/src/hash_utils.rs — both sides hash the
+# stripped form.
+#
+# chain_getBlock: GRANDPA justifications are gossip-based and differ per node.
+#
+# EVM block/tx objects: execution clients disagree on presentation-only
+# fields for the same canonical block —
+#   - size: RLP-encoded length, computed client-side (geth-bsc builds differ
+#     by a byte on the same block)
+#   - totalDifficulty: dropped by reth/newer geth, still served by others
+#   - milliTimestamp: BSC Maxwell extension, not emitted by every client
+#   - transactions[].blockTimestamp: added by geth >= 1.16 / erigon >= 3.5
+#     (execution-apis addition), absent in reth <= 2.1
+# All of these are either derivable or already committed to by the block
+# `hash` field, so stripping them does not weaken verification.
+_EVM_BLOCK_FIELDS = ["size", "totalDifficulty", "milliTimestamp"]
+_EVM_TX_FIELDS = ["blockTimestamp"]
+
+_NONDETERMINISTIC_SPECS: dict[str, dict[str, list[str]]] = {
+    "chain_getBlock": {"fields": ["justifications"]},
+    "eth_getBlockByNumber": {"fields": _EVM_BLOCK_FIELDS, "tx_fields": _EVM_TX_FIELDS},
+    "eth_getBlockByHash": {"fields": _EVM_BLOCK_FIELDS, "tx_fields": _EVM_TX_FIELDS},
+    "eth_getUncleByBlockNumberAndIndex": {"fields": _EVM_BLOCK_FIELDS},
+    "eth_getUncleByBlockHashAndIndex": {"fields": _EVM_BLOCK_FIELDS},
+    "eth_getTransactionByBlockNumberAndIndex": {"fields": _EVM_TX_FIELDS},
+    "eth_getTransactionByBlockHashAndIndex": {"fields": _EVM_TX_FIELDS},
+    "eth_getTransactionByHash": {"fields": _EVM_TX_FIELDS},
 }
 
 
 def _strip_nondeterministic(response: Any, method: str | None) -> Any:
-    if method and method in _NONDETERMINISTIC_FIELDS and isinstance(response, dict):
-        cleaned = {
-            k: v
-            for k, v in response.items()
-            if k not in _NONDETERMINISTIC_FIELDS[method]
-        }
-        return cleaned
-    return response
+    spec = _NONDETERMINISTIC_SPECS.get(method) if method else None
+    if spec is None or not isinstance(response, dict):
+        return response
+
+    drop = set(spec.get("fields", ()))
+    cleaned = {k: v for k, v in response.items() if k not in drop}
+
+    tx_drop = set(spec.get("tx_fields", ()))
+    txs = cleaned.get("transactions")
+    if tx_drop and isinstance(txs, list):
+        # Full-tx block responses embed tx objects; hash-only responses are
+        # plain strings and pass through untouched.
+        cleaned["transactions"] = [
+            {k: v for k, v in tx.items() if k not in tx_drop}
+            if isinstance(tx, dict)
+            else tx
+            for tx in txs
+        ]
+    return cleaned
+
+
+def hash_response_variants(response: Any, method: str | None = None) -> list[str]:
+    """Acceptable reference hashes for a response, canonical form first.
+
+    The miner-side hash is computed by the gateway at serve time, so during
+    a rollout the two sides may be on different hashing rules. Accepting any
+    variant keeps mixed fleets safe for the observed per-tx blockTimestamp
+    skew in full-block responses regardless of deploy order. Two residual
+    old-gateway gaps close only once the gateway canonicalizes, because the
+    miner-side hash bakes in a value this function cannot synthesize:
+    value-level skew such as `size`, and standalone tx responses
+    (eth_getTransactionByBlock*AndIndex / ByHash) where the reference client
+    omits blockTimestamp but the miner's client includes it — the tx object
+    carries no block timestamp to add. (The reverse standalone-tx direction
+    is covered: the canonical variant IS the reference stripped of
+    blockTimestamp.) Variants:
+
+    1. canonical (nondeterministic fields stripped) — gateways at or above
+       the canonicalization release
+    2. legacy raw — older gateways, miner on the same client as the reference
+    3. legacy raw + per-tx blockTimestamp — older gateways, miner on
+       geth >= 1.16 / erigon >= 3.5 while the reference client omits it
+    4. legacy raw - per-tx blockTimestamp — the reverse: reference emits it,
+       miner's client does not
+    """
+    variants = [hash_response(response, method)]
+
+    spec = _NONDETERMINISTIC_SPECS.get(method) if method else None
+    if spec is not None:
+        variants.append(hash_response(response))
+
+        if "tx_fields" in spec and isinstance(response, dict):
+            timestamp = response.get("timestamp")
+            txs = response.get("transactions")
+            if timestamp is not None and isinstance(txs, list):
+                augmented = dict(response)
+                augmented["transactions"] = [
+                    {**tx, "blockTimestamp": timestamp} if isinstance(tx, dict) else tx
+                    for tx in txs
+                ]
+                variants.append(hash_response(augmented))
+
+                stripped = dict(response)
+                stripped["transactions"] = [
+                    {k: v for k, v in tx.items() if k != "blockTimestamp"}
+                    if isinstance(tx, dict)
+                    else tx
+                    for tx in txs
+                ]
+                variants.append(hash_response(stripped))
+
+    seen: set[str] = set()
+    return [v for v in variants if not (v in seen or seen.add(v))]
 
 
 NULL_RESPONSE_HASH = hash_response(None)
