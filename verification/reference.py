@@ -376,18 +376,33 @@ class ReferenceNodeManager:
             base = GatewayReferenceClient(
                 url, "base", self._token_provider, self.timeout_ms
             )
+            polygon = GatewayReferenceClient(
+                url, "polygon", self._token_provider, self.timeout_ms
+            )
+            optimism = GatewayReferenceClient(
+                url, "optimism", self._token_provider, self.timeout_ms
+            )
+            arbitrum = GatewayReferenceClient(
+                url, "arbitrum", self._token_provider, self.timeout_ms
+            )
             logger.info(f"Initialized gateway reference clients via {url}")
         else:
             tao = SubstrateReferenceClient(self.config.tao, self.timeout_ms)
             eth = EthereumReferenceClient(self.config.eth, self.timeout_ms)
             bsc = EthereumReferenceClient(self.config.bsc, self.timeout_ms)
             base = EthereumReferenceClient(self.config.base, self.timeout_ms)
+            polygon = EthereumReferenceClient(self.config.polygon, self.timeout_ms)
+            optimism = EthereumReferenceClient(self.config.optimism, self.timeout_ms)
+            arbitrum = EthereumReferenceClient(self.config.arbitrum, self.timeout_ms)
             logger.info("Initialized direct reference clients")
 
         self._clients[Chain.TAO.value] = tao
         self._clients[Chain.ETH.value] = eth
         self._clients[Chain.BSC.value] = bsc
         self._clients[Chain.BASE.value] = base
+        self._clients[Chain.POLYGON.value] = polygon
+        self._clients[Chain.OPTIMISM.value] = optimism
+        self._clients[Chain.ARBITRUM.value] = arbitrum
 
         for alias, canonical in CHAIN_ALIASES.items():
             self._clients[alias] = self._clients[canonical]

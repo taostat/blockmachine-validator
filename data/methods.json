@@ -9,7 +9,10 @@
   },
   "inherit": {
     "BSC": "ETH",
-    "BASE": "ETH"
+    "BASE": "ETH",
+    "POLYGON": "ETH",
+    "OPTIMISM": "ETH",
+    "ARBITRUM": "ETH"
   },
   "methods": {
     "TAO": {
