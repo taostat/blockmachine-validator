@@ -512,4 +512,8 @@ class LoggedVerifier:
             "POLYGON",
             "OPTIMISM",
             "ARBITRUM",
+            "AVALANCHE",
+            "SCROLL",
+            "MANTLE",
+            "ROBINHOOD",
         }

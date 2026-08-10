@@ -93,6 +93,10 @@ The validator fetches network-wide settings (epoch length, scoring, reference no
 | `REFERENCE_POLYGON_URL` | Override the registry-provided Polygon reference RPC endpoint | — |
 | `REFERENCE_OPTIMISM_URL` | Override the registry-provided Optimism reference RPC endpoint | — |
 | `REFERENCE_ARBITRUM_URL` | Override the registry-provided Arbitrum reference RPC endpoint | — |
+| `REFERENCE_AVALANCHE_URL` | Override the registry-provided Avalanche reference RPC endpoint | — |
+| `REFERENCE_SCROLL_URL` | Override the registry-provided Scroll reference RPC endpoint | — |
+| `REFERENCE_MANTLE_URL` | Override the registry-provided Mantle reference RPC endpoint | — |
+| `REFERENCE_ROBINHOOD_URL` | Override the registry-provided Robinhood reference RPC endpoint | — |
 
 Everything else — reference nodes, burn sink, S3 bucket, verification gateway — is served by the registry and automatically applied at startup. The validator signs a challenge with its hotkey to authenticate against the registry; no manual tokens to manage.
 
