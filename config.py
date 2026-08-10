@@ -65,6 +65,10 @@ class ReferenceNodesConfig:
     polygon: str = ""
     optimism: str = ""
     arbitrum: str = ""
+    avalanche: str = ""
+    scroll: str = ""
+    mantle: str = ""
+    robinhood: str = ""
 
 
 @dataclass
@@ -138,6 +142,10 @@ def apply_registry_config(config: ValidatorConfig, data: dict) -> None:
     _env_str(config.reference_nodes, "polygon", "REFERENCE_POLYGON_URL")
     _env_str(config.reference_nodes, "optimism", "REFERENCE_OPTIMISM_URL")
     _env_str(config.reference_nodes, "arbitrum", "REFERENCE_ARBITRUM_URL")
+    _env_str(config.reference_nodes, "avalanche", "REFERENCE_AVALANCHE_URL")
+    _env_str(config.reference_nodes, "scroll", "REFERENCE_SCROLL_URL")
+    _env_str(config.reference_nodes, "mantle", "REFERENCE_MANTLE_URL")
+    _env_str(config.reference_nodes, "robinhood", "REFERENCE_ROBINHOOD_URL")
 
     # S3 location only — credentials are not in the registry payload.
     s3 = data.get("s3", {}) or {}

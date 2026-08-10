@@ -12,7 +12,11 @@
     "BASE": "ETH",
     "POLYGON": "ETH",
     "OPTIMISM": "ETH",
-    "ARBITRUM": "ETH"
+    "ARBITRUM": "ETH",
+    "AVALANCHE": "ETH",
+    "SCROLL": "ETH",
+    "MANTLE": "ETH",
+    "ROBINHOOD": "ETH"
   },
   "methods": {
     "TAO": {

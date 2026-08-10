@@ -235,3 +235,99 @@ async def test_wrong_block_content_still_fails():
 
     assert len(results) == 1
     assert not results[0].is_correct
+
+
+# --- OP-stack deposit transactions (optimism/base, Aug 2026 follow-up) ---
+# Newer op-geth/op-reth include `nonce` (derived deposit nonce) and
+# `depositReceiptVersion` on type-0x7e tx objects; reth <= 2.3-era builds
+# omit both. Signal 360 reproduced byte-for-byte from this skew alone.
+
+
+def _op_block_new_client() -> dict:
+    return {
+        "hash": "0xophash",
+        "number": "0x7480dbc",
+        "timestamp": "0x689168ab",
+        "size": "0xba7",
+        "transactions": [
+            {
+                "hash": "0xdd",
+                "type": "0x7e",
+                "sourceHash": "0xsrc",
+                "mint": "0x0",
+                "value": "0x0",
+                "nonce": "0x16b4b2",
+                "depositReceiptVersion": "0x1",
+                "blockTimestamp": "0x689168ab",
+            },
+            {"hash": "0xee", "type": "0x2", "nonce": "0x5", "value": "0x1"},
+        ],
+    }
+
+
+def _op_block_old_client() -> dict:
+    blk = _op_block_new_client()
+    for tx in blk["transactions"]:
+        tx.pop("blockTimestamp", None)
+        if tx["type"] == "0x7e":
+            tx.pop("nonce", None)
+            tx.pop("depositReceiptVersion", None)
+    return blk
+
+
+def test_deposit_tx_client_skew_hashes_equal():
+    for method in ("eth_getBlockByNumber", "eth_getBlockByHash"):
+        assert hash_response(_op_block_new_client(), method) == hash_response(
+            _op_block_old_client(), method
+        )
+
+
+def test_deposit_tx_cross_language_vector():
+    # Pinned digest shared with gateway/src/hash_utils.rs
+    # test_deposit_tx_hash_matches_validator_vector.
+    assert (
+        hash_response(_op_block_new_client(), "eth_getBlockByNumber")
+        == "97f0e5000a3c863e0d398dda9a80dec58f0834818fee5c0b65053eaa88223350"
+    )
+
+
+def test_ordinary_tx_nonce_still_verified():
+    a = _op_block_new_client()
+    b = _op_block_new_client()
+    b["transactions"][1]["nonce"] = "0xdead"
+    assert hash_response(a, "eth_getBlockByNumber") != hash_response(
+        b, "eth_getBlockByNumber"
+    )
+
+
+def test_standalone_deposit_tx_stripped():
+    new = {
+        "hash": "0xdd",
+        "type": "0x7e",
+        "sourceHash": "0xsrc",
+        "nonce": "0x16b4b2",
+        "depositReceiptVersion": "0x1",
+        "blockTimestamp": "0x689168ab",
+    }
+    old = {"hash": "0xdd", "type": "0x7e", "sourceHash": "0xsrc"}
+    for method in (
+        "eth_getTransactionByHash",
+        "eth_getTransactionByBlockNumberAndIndex",
+        "eth_getTransactionByBlockHashAndIndex",
+    ):
+        assert hash_response(new, method) == hash_response(old, method)
+
+
+def test_variants_cover_first_canonical_release():
+    # A gateway on the first canonicalization build strips size/blockTimestamp
+    # but NOT deposit fields; a 0.2.8 validator must still accept its hashes.
+    ref = _op_block_new_client()
+    prev_canonical = dict(ref)
+    prev_canonical.pop("size")
+    prev_canonical["transactions"] = [
+        {k: v for k, v in tx.items() if k != "blockTimestamp"}
+        for tx in ref["transactions"]
+    ]
+    variants = hash_response_variants(ref, "eth_getBlockByNumber")
+    assert variants[0] == hash_response(ref, "eth_getBlockByNumber")
+    assert hash_response(prev_canonical) in variants

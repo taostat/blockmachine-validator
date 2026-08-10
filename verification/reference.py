@@ -385,6 +385,18 @@ class ReferenceNodeManager:
             arbitrum = GatewayReferenceClient(
                 url, "arbitrum", self._token_provider, self.timeout_ms
             )
+            avalanche = GatewayReferenceClient(
+                url, "avalanche", self._token_provider, self.timeout_ms
+            )
+            scroll = GatewayReferenceClient(
+                url, "scroll", self._token_provider, self.timeout_ms
+            )
+            mantle = GatewayReferenceClient(
+                url, "mantle", self._token_provider, self.timeout_ms
+            )
+            robinhood = GatewayReferenceClient(
+                url, "robinhood", self._token_provider, self.timeout_ms
+            )
             logger.info(f"Initialized gateway reference clients via {url}")
         else:
             tao = SubstrateReferenceClient(self.config.tao, self.timeout_ms)
@@ -394,6 +406,10 @@ class ReferenceNodeManager:
             polygon = EthereumReferenceClient(self.config.polygon, self.timeout_ms)
             optimism = EthereumReferenceClient(self.config.optimism, self.timeout_ms)
             arbitrum = EthereumReferenceClient(self.config.arbitrum, self.timeout_ms)
+            avalanche = EthereumReferenceClient(self.config.avalanche, self.timeout_ms)
+            scroll = EthereumReferenceClient(self.config.scroll, self.timeout_ms)
+            mantle = EthereumReferenceClient(self.config.mantle, self.timeout_ms)
+            robinhood = EthereumReferenceClient(self.config.robinhood, self.timeout_ms)
             logger.info("Initialized direct reference clients")
 
         self._clients[Chain.TAO.value] = tao
@@ -403,6 +419,10 @@ class ReferenceNodeManager:
         self._clients[Chain.POLYGON.value] = polygon
         self._clients[Chain.OPTIMISM.value] = optimism
         self._clients[Chain.ARBITRUM.value] = arbitrum
+        self._clients[Chain.AVALANCHE.value] = avalanche
+        self._clients[Chain.SCROLL.value] = scroll
+        self._clients[Chain.MANTLE.value] = mantle
+        self._clients[Chain.ROBINHOOD.value] = robinhood
 
         for alias, canonical in CHAIN_ALIASES.items():
             self._clients[alias] = self._clients[canonical]

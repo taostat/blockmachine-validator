@@ -17,6 +17,10 @@ class Chain(Enum):
     POLYGON = "POLYGON"
     OPTIMISM = "OPTIMISM"
     ARBITRUM = "ARBITRUM"
+    AVALANCHE = "AVALANCHE"
+    SCROLL = "SCROLL"
+    MANTLE = "MANTLE"
+    ROBINHOOD = "ROBINHOOD"
 
 
 @dataclass
@@ -238,27 +242,49 @@ def hash_response(response: Any, method: str | None = None) -> str:
 #   - milliTimestamp: BSC Maxwell extension, not emitted by every client
 #   - transactions[].blockTimestamp: added by geth >= 1.16 / erigon >= 3.5
 #     (execution-apis addition), absent in reth <= 2.1
+#   - deposit txs (OP-stack type 0x7e, optimism/base): newer op-geth/op-reth
+#     include `nonce` (the derived deposit nonce) and `depositReceiptVersion`
+#     in the tx object, reth <= 2.3-era builds omit both. Deposit txs carry
+#     no signature-supplied nonce — it is derived at execution — so the field
+#     is presentation-only there. Stripped ONLY on type 0x7e; the nonce of
+#     ordinary txs stays verified.
 # All of these are either derivable or already committed to by the block
 # `hash` field, so stripping them does not weaken verification.
 _EVM_BLOCK_FIELDS = ["size", "totalDifficulty", "milliTimestamp"]
 _EVM_TX_FIELDS = ["blockTimestamp"]
+_EVM_DEPOSIT_TX_TYPE = "0x7e"
+_EVM_DEPOSIT_TX_FIELDS = ["nonce", "depositReceiptVersion"]
 
-_NONDETERMINISTIC_SPECS: dict[str, dict[str, list[str]]] = {
+# "tx_object": the result itself is a transaction object.
+# "tx_fields": the result is a block whose `transactions` may embed tx objects.
+_NONDETERMINISTIC_SPECS: dict[str, dict[str, Any]] = {
     "chain_getBlock": {"fields": ["justifications"]},
     "eth_getBlockByNumber": {"fields": _EVM_BLOCK_FIELDS, "tx_fields": _EVM_TX_FIELDS},
     "eth_getBlockByHash": {"fields": _EVM_BLOCK_FIELDS, "tx_fields": _EVM_TX_FIELDS},
     "eth_getUncleByBlockNumberAndIndex": {"fields": _EVM_BLOCK_FIELDS},
     "eth_getUncleByBlockHashAndIndex": {"fields": _EVM_BLOCK_FIELDS},
-    "eth_getTransactionByBlockNumberAndIndex": {"fields": _EVM_TX_FIELDS},
-    "eth_getTransactionByBlockHashAndIndex": {"fields": _EVM_TX_FIELDS},
-    "eth_getTransactionByHash": {"fields": _EVM_TX_FIELDS},
+    "eth_getTransactionByBlockNumberAndIndex": {"tx_object": True},
+    "eth_getTransactionByBlockHashAndIndex": {"tx_object": True},
+    "eth_getTransactionByHash": {"tx_object": True},
 }
+
+
+def _strip_tx_object(tx: Any, tx_drop: set[str]) -> Any:
+    if not isinstance(tx, dict):
+        return tx
+    drop = tx_drop
+    if tx.get("type") == _EVM_DEPOSIT_TX_TYPE:
+        drop = tx_drop | set(_EVM_DEPOSIT_TX_FIELDS)
+    return {k: v for k, v in tx.items() if k not in drop}
 
 
 def _strip_nondeterministic(response: Any, method: str | None) -> Any:
     spec = _NONDETERMINISTIC_SPECS.get(method) if method else None
     if spec is None or not isinstance(response, dict):
         return response
+
+    if spec.get("tx_object"):
+        return _strip_tx_object(response, set(_EVM_TX_FIELDS))
 
     drop = set(spec.get("fields", ()))
     cleaned = {k: v for k, v in response.items() if k not in drop}
@@ -268,13 +294,33 @@ def _strip_nondeterministic(response: Any, method: str | None) -> Any:
     if tx_drop and isinstance(txs, list):
         # Full-tx block responses embed tx objects; hash-only responses are
         # plain strings and pass through untouched.
+        cleaned["transactions"] = [_strip_tx_object(tx, tx_drop) for tx in txs]
+    return cleaned
+
+
+def _hash_previous_canonical(response: Any, spec: dict[str, Any]) -> str:
+    """Hash under the first canonicalization release's rules (v0.2.7 /
+    initial gateway canonical build): block fields and per-tx blockTimestamp
+    stripped, but WITHOUT the deposit-tx nonce/depositReceiptVersion strip."""
+    if not isinstance(response, dict):
+        return hash_response(response)
+
+    if spec.get("tx_object"):
+        cleaned = {k: v for k, v in response.items() if k not in _EVM_TX_FIELDS}
+        return hash_response(cleaned)
+
+    drop = set(spec.get("fields", ()))
+    cleaned = {k: v for k, v in response.items() if k not in drop}
+    tx_drop = set(spec.get("tx_fields", ()))
+    txs = cleaned.get("transactions")
+    if tx_drop and isinstance(txs, list):
         cleaned["transactions"] = [
             {k: v for k, v in tx.items() if k not in tx_drop}
             if isinstance(tx, dict)
             else tx
             for tx in txs
         ]
-    return cleaned
+    return hash_response(cleaned)
 
 
 def hash_response_variants(response: Any, method: str | None = None) -> list[str]:
@@ -295,16 +341,21 @@ def hash_response_variants(response: Any, method: str | None = None) -> list[str
 
     1. canonical (nondeterministic fields stripped) — gateways at or above
        the canonicalization release
-    2. legacy raw — older gateways, miner on the same client as the reference
-    3. legacy raw + per-tx blockTimestamp — older gateways, miner on
+    2. previous-canonical (everything except the deposit-tx strip) —
+       gateways on the first canonicalization release, for OP-stack blocks
+       whose reference response carries deposit `nonce` /
+       `depositReceiptVersion`
+    3. legacy raw — older gateways, miner on the same client as the reference
+    4. legacy raw + per-tx blockTimestamp — older gateways, miner on
        geth >= 1.16 / erigon >= 3.5 while the reference client omits it
-    4. legacy raw - per-tx blockTimestamp — the reverse: reference emits it,
+    5. legacy raw - per-tx blockTimestamp — the reverse: reference emits it,
        miner's client does not
     """
     variants = [hash_response(response, method)]
 
     spec = _NONDETERMINISTIC_SPECS.get(method) if method else None
     if spec is not None:
+        variants.append(_hash_previous_canonical(response, spec))
         variants.append(hash_response(response))
 
         if "tx_fields" in spec and isinstance(response, dict):
