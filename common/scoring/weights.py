@@ -91,45 +91,47 @@ def normalize_weights(
 ) -> list[tuple[int, int]]:
     """Normalize float weights to u16 values for on-chain submission.
 
-    Burn UID is always set to MAX_WEIGHT (65535) so the chain's
-    max-normalization (which scales the largest weight to 65535) is a
-    no-op and the submitted proportions are preserved exactly.
+    Weights are scaled against the LARGEST weight in the set, whichever
+    entry that is. The chain applies its own max-normalization (scaling
+    the largest submitted weight to 65535), so pinning our largest to
+    MAX_WEIGHT makes that pass a no-op and the submitted proportions
+    survive exactly.
 
-    Miner weights use the largest-remainder method (the same algorithm
-    used in proportional-representation elections) to optimally round
-    fractional u16 values, minimising quantisation error to <1%.
+    Burn is treated as an ordinary entry. It is not special-cased and it
+    is not required to be present: when the caller passes no burn weight,
+    the miners are simply normalized among themselves and nothing is
+    burned.
+
+    Previously burn was pinned to MAX_WEIGHT and every miner was scaled
+    as ``(w / burn_weight) * MAX_WEIGHT``. That could not express two
+    legitimate states: a zero burn returned ``[(burn_uid, MAX_WEIGHT)]``
+    — 100% to burn, no miner paid — and any burn below the largest
+    miner's share overflowed u16, because the ratio it scaled by
+    exceeded 1. Normalizing against the maximum is equivalent whenever
+    burn is the largest weight, so existing behaviour is preserved while
+    the other states become representable.
+
+    Rounding uses the largest-remainder method (as in
+    proportional-representation elections) to minimise quantisation
+    error.
     """
     cleaned: list[tuple[int, float]] = [
-        (uid, w) for uid, w in miner_weights if w and w > 0
+        (uid, w) for uid, w in miner_weights if math.isfinite(w) and w > 0
     ]
 
+    # Nothing payable at all — no miners and no burn. Fail closed to a
+    # full burn rather than submitting an empty weight vector: an epoch
+    # with nothing to distribute must not silently pay someone.
     if not cleaned:
         return [(burn_uid, MAX_WEIGHT)]
 
-    # Extract the burn weight from the list
-    burn_weight = 0.0
-    miners_only: list[tuple[int, float]] = []
-    for uid, w in cleaned:
-        if uid == burn_uid:
-            burn_weight = w
-        else:
-            miners_only.append((uid, w))
+    max_weight = max(w for _, w in cleaned)
 
-    if burn_weight <= 0 or not miners_only:
-        return [(burn_uid, MAX_WEIGHT)]
-
-    # Burn always gets MAX_WEIGHT.  Miner weights are scaled relative to
-    # burn so the ratio miner/burn is preserved after the chain's
-    # max-normalization pass.
-    #
     # Largest-remainder rounding:
-    #   1. Compute the ideal (fractional) u16 value for each miner.
-    #   2. Give each miner the floor of their ideal value.
-    #   3. Distribute the leftover points (ideal_total - floor_total)
-    #      to the miners with the largest fractional remainders.
-    ideals = [
-        (uid, (w / burn_weight) * MAX_WEIGHT) for uid, w in miners_only
-    ]
+    #   1. Compute the ideal (fractional) u16 value for each entry.
+    #   2. Give each entry the floor of its ideal value.
+    #   3. Distribute the leftover points to the largest remainders.
+    ideals = [(uid, (w / max_weight) * MAX_WEIGHT) for uid, w in cleaned]
 
     floors = [
         (uid, math.floor(ideal), ideal - math.floor(ideal))
@@ -143,11 +145,16 @@ def normalize_weights(
     # Sort by fractional remainder descending; top-N get +1
     floors.sort(key=lambda x: -x[2])
 
-    result: list[tuple[int, int]] = [(burn_uid, MAX_WEIGHT)]
+    result: list[tuple[int, int]] = []
     for i, (uid, f, _rem) in enumerate(floors):
         u16_weight = f + (1 if i < extras else 0)
         if u16_weight <= 0:
             continue
-        result.append((uid, u16_weight))
+        result.append((uid, min(u16_weight, MAX_WEIGHT)))
+
+    # Defensive: if rounding somehow eliminated every entry, burn rather
+    # than submit nothing.
+    if not result:
+        return [(burn_uid, MAX_WEIGHT)]
 
     return result
