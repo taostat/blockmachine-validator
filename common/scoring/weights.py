@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 
 MINER_EMISSION_PCT = 0.41
 
+# Fail-closed bound for the payout scale (see compute_epoch_weights). Scale
+# near 1 is normal; an order of magnitude above it means consumption
+# collapsed and distributing the pool over it would misallocate, not pay.
+SCALE_SANITY_MAX = 10.0
+
 
 def compute_epoch_weights(
     miners_data: list[MinerEpochData],
@@ -52,9 +57,47 @@ def compute_epoch_weights(
             )
         )
 
-    scale = (
-        min(1.0, miner_pool_usd / total_consumed_usd) if total_consumed_usd > 0 else 1.0
-    )
+    # Unclamped: scale = pool / consumed, in BOTH directions. This is what
+    # makes burn zero every epoch.
+    #
+    # Previously this was min(1.0, pool/consumed): when consumed < pool the
+    # scale pinned at 1.0, miners were paid only what they consumed, and the
+    # unspent remainder of the pool burned. Removing the cap fills the pool
+    # exactly — total_payout_alpha == miner_pool_alpha, so burn == 0 — and the
+    # alpha price cancels out of the resulting weights entirely (they reduce
+    # to consumed_i / consumed_total).
+    #
+    # The pool cannot be overpaid: scale is UNIFORM across miners, so it never
+    # changes the miner-to-miner split, and the weights below normalise to
+    # shares of miner_pool_alpha, which is fixed. Scale only decides how much
+    # of the pool is distributed vs burned.
+    #
+    # SCALE_SANITY_MAX is the fail-closed bound. A scale this far above 1
+    # means consumption collapsed — most plausibly the upstream allocation was
+    # never injected — and an unclamped scale would hand the ENTIRE pool to
+    # whoever had traffic that epoch. That turns a benign upstream outage into
+    # a capture event, so past the bound we revert to the historical clamped
+    # behaviour (pay consumption at face value, burn the rest) and log loudly.
+    # The bound is deliberately loose: normal operation sits near 1, and the
+    # outage shape is an order of magnitude above it.
+    if total_consumed_usd > 0:
+        scale = miner_pool_usd / total_consumed_usd
+        if scale > SCALE_SANITY_MAX:
+            logger.error(
+                "epoch weights: scale %.2f exceeds sanity bound %.1f "
+                "(pool_usd=%.4f, consumed_usd=%.4f). Consumption has "
+                "collapsed relative to the pool — refusing to distribute the "
+                "whole pool over it. Falling back to clamped behaviour "
+                "(scale=1.0, remainder burns).",
+                scale,
+                SCALE_SANITY_MAX,
+                miner_pool_usd,
+                total_consumed_usd,
+            )
+            scale = 1.0
+    else:
+        # Nothing consumed at all: nothing to split, remainder burns.
+        scale = 1.0
 
     total_payout_alpha = 0.0
     for r in results:
@@ -62,7 +105,13 @@ def compute_epoch_weights(
         r.payout_alpha = r.payout_usd / alpha_price_usd
         total_payout_alpha += r.payout_alpha
 
-    burn_alpha = miner_pool_alpha - total_payout_alpha
+    # Clamp float dust: in the pool-filling branch burn is algebraically
+    # zero, but binary float summation can leave it at ~-1e-14. Negative
+    # burn is meaningless (and would leak into reported burn_pct and the
+    # DB), so floor at zero. On-chain this is moot either way -- u16
+    # quantisation absorbs epsilon and the submitter only appends burn
+    # when it is strictly positive.
+    burn_alpha = max(0.0, miner_pool_alpha - total_payout_alpha)
     burn_pct = burn_alpha / miner_pool_alpha if miner_pool_alpha > 0 else 0
 
     for r in results:
