@@ -142,6 +142,20 @@ class TestDegenerateInputs:
         )
         assert set(result) == {1}
 
+    def test_infinite_weight_dropped_not_crash(self):
+        # +inf used to survive the cleaner, making max_weight infinite,
+        # ideals NaN, and math.floor(NaN) raise — no weights submitted.
+        result = as_dict(
+            normalize_weights([(1, 0.5), (2, float("inf"))], BURN_UID)
+        )
+        assert set(result) == {1}
+        assert result[1] == MAX_WEIGHT
+
+    def test_all_infinite_burns(self):
+        assert normalize_weights([(1, float("inf"))], BURN_UID) == [
+            (BURN_UID, MAX_WEIGHT)
+        ]
+
 
 class TestInvariants:
     @pytest.mark.parametrize("seed", range(20))

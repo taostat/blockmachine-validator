@@ -116,7 +116,7 @@ def normalize_weights(
     error.
     """
     cleaned: list[tuple[int, float]] = [
-        (uid, w) for uid, w in miner_weights if w and w > 0
+        (uid, w) for uid, w in miner_weights if math.isfinite(w) and w > 0
     ]
 
     # Nothing payable at all — no miners and no burn. Fail closed to a
