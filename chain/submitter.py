@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from validator.common.scoring.weights import normalize_weights
@@ -5,6 +6,13 @@ from validator.config import WeightConfig
 from validator.protocols import ChainInterface
 
 logger = logging.getLogger(__name__)
+
+
+# Verification polling: the SDK submits with wait_for_finalization=True, so
+# the first read normally already sees the commit; the retries only cover
+# read lag. ~12s is one block.
+_VERIFY_ATTEMPTS = 5
+_VERIFY_DELAY_SECS = 12.0
 
 
 class WeightSubmitter:
@@ -40,15 +48,61 @@ class WeightSubmitter:
             logger.info(f"  UID {uid}: {w}{label}")
 
         try:
-            success = await self.chain.set_weights(uids, values)
-            if success:
-                logger.info("Weights submitted successfully")
-            else:
-                logger.error("Weight submission returned False")
-            return success
+            # Captured BEFORE the submit so the chain read below answers
+            # "did THIS submit land", not "have we ever committed".
+            since_block = await self.chain.get_current_block()
+            claimed = await self.chain.set_weights(uids, values)
         except Exception as e:
             logger.error(f"Weight submission error: {e}")
             return False
+
+        if not claimed:
+            logger.error("Weight submission rejected — will retry")
+            return False
+
+        # The SDK's verdict is the submitter reporting on itself. The only
+        # proof a commit exists is reading it back from chain storage —
+        # every cause of non-arrival (rate-limit rejection, network error,
+        # a lying return value) presents identically as "not in storage",
+        # so no failure classification is needed.
+        verified = await self._commit_landed_on_chain(since_block)
+        if verified:
+            logger.info("Weights submitted successfully")
+        return verified
+
+    async def _commit_landed_on_chain(self, since_block: int) -> bool:
+        could_not_read = 0
+        for attempt in range(_VERIFY_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_VERIFY_DELAY_SECS)
+            proof = await self.chain.verify_weight_commit_landed(since_block)
+            if proof is None:
+                could_not_read += 1
+                continue
+            if proof.get("landed"):
+                logger.info(
+                    f"Commit verified on chain: epoch={proof.get('epoch')} "
+                    f"block={proof.get('commit_block')} "
+                    f"reveal_round={proof.get('reveal_round')} "
+                    f"ct_len={proof.get('ct_len')}"
+                )
+                return True
+            # Definite absence: keep polling briefly for inclusion lag,
+            # then fail so the loop retries.
+        if could_not_read == _VERIFY_ATTEMPTS:
+            logger.error(
+                "Could not read the chain to verify the commit — treating "
+                "as NOT submitted (fail-closed). A duplicate retry is "
+                "harmless: the chain's rate limit rejects it if the "
+                "original landed."
+            )
+        else:
+            logger.error(
+                f"SDK claimed success but no commit of ours is on chain "
+                f"since block {since_block} — treating as NOT submitted "
+                f"so the epoch stays unprocessed and is retried."
+            )
+        return False
 
     async def blocks_until_next_epoch(self) -> int:
         block = await self.chain.get_current_block()
