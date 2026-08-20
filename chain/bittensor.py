@@ -273,6 +273,10 @@ class BittensorChain:
         mechanism_id * GLOBAL_MAX_SUBNET_COUNT + netuid; for the main
         mechanism (0) that is just the netuid.
         """
+        # The whole body is fail-to-None: parsing a storage entry can
+        # raise just as a read can, and an exception here must become
+        # "could not verify", never bubble into the submit path (same
+        # exception scope as get_pending_weight_commits above).
         try:
             async with self._subtensor_lock:
                 await self._maybe_reconnect()
@@ -286,8 +290,13 @@ class BittensorChain:
                     if epoch_res is not None and epoch_res.value is not None
                     else 0
                 )
+                # epoch-1 covers verification delayed across a rollover
+                # (the commit landed under the previous index); epoch+1
+                # covers the chain's lookahead tagging at a fire-block.
+                # since_block keeps all three honest.
+                epochs = [ep for ep in (epoch - 1, epoch, epoch + 1) if ep >= 0]
                 raw: list = []
-                for ep in (epoch, epoch + 1):
+                for ep in epochs:
                     res = self.subtensor.substrate.query(
                         "SubtensorModule", "TimelockedWeightCommits", [self.netuid, ep]
                     )
@@ -296,38 +305,40 @@ class BittensorChain:
                     if res is not None and res.value:
                         raw.extend((ep, entry) for entry in res.value)
                 self._consecutive_failures = 0
+
+            ss58 = self.hotkey.ss58_address
+            pub = getattr(self.hotkey, "public_key", None)
+            pub_hex = (
+                pub.hex().lower() if isinstance(pub, (bytes, bytearray)) else None
+            )
+            for ep, entry in raw:
+                try:
+                    who, commit_block, ciphertext, reveal_round = entry
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"Unrecognized TimelockedWeightCommits entry shape: "
+                        f"{type(entry).__name__}"
+                    )
+                    continue
+                if not self._is_our_account(who, ss58, pub_hex):
+                    continue
+                if int(commit_block) >= since_block:
+                    return {
+                        "landed": True,
+                        "epoch": ep,
+                        "commit_block": int(commit_block),
+                        "reveal_round": int(reveal_round),
+                        "ct_len": self._ciphertext_len(ciphertext),
+                    }
+            return {
+                "landed": False,
+                "epochs_checked": epochs,
+                "since_block": since_block,
+            }
         except Exception as e:
             self._consecutive_failures += 1
-            logger.warning(f"Could not read TimelockedWeightCommits: {e}")
+            logger.warning(f"Could not verify TimelockedWeightCommits: {e}")
             return None
-
-        ss58 = self.hotkey.ss58_address
-        pub = getattr(self.hotkey, "public_key", None)
-        pub_hex = pub.hex().lower() if isinstance(pub, (bytes, bytearray)) else None
-        for ep, entry in raw:
-            try:
-                who, commit_block, ciphertext, reveal_round = entry
-            except (TypeError, ValueError):
-                logger.warning(
-                    f"Unrecognized TimelockedWeightCommits entry shape: "
-                    f"{type(entry).__name__}"
-                )
-                continue
-            if not self._is_our_account(who, ss58, pub_hex):
-                continue
-            if int(commit_block) >= since_block:
-                return {
-                    "landed": True,
-                    "epoch": ep,
-                    "commit_block": int(commit_block),
-                    "reveal_round": int(reveal_round),
-                    "ct_len": self._ciphertext_len(ciphertext),
-                }
-        return {
-            "landed": False,
-            "epochs_checked": [epoch, epoch + 1],
-            "since_block": since_block,
-        }
 
     @staticmethod
     def _is_our_account(acct, ss58: str, pub_hex: str | None) -> bool:

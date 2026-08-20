@@ -192,10 +192,22 @@ class TestSubmitterVerifiesOnChain:
         assert chain.verify_calls == 2
 
     @pytest.mark.asyncio
-    async def test_a_rejected_claim_fails_without_consulting_the_chain(self):
-        chain = _FakeChain(claimed=False, proofs=[LANDED])
+    async def test_a_rejected_claim_with_no_commit_fails_after_one_read(self):
+        # A claimed rejection gets a single storage read (nothing to wait
+        # for), not the full inclusion-lag poll.
+        chain = _FakeChain(claimed=False, proofs=[ABSENT])
         assert await _submitter(chain).submit([(1, 0.5)], 0.5) is False
-        assert chain.verify_calls == 0
+        assert chain.verify_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_an_sdk_false_negative_is_overruled_by_storage(self):
+        # Storage is the proof in BOTH directions: if the SDK reports a
+        # rejection but the commit is on chain, the submit is a success —
+        # otherwise a lying "rejected" would trigger a retry loop against
+        # a commit that already landed.
+        chain = _FakeChain(claimed=False, proofs=[LANDED])
+        assert await _submitter(chain).submit([(1, 0.5)], 0.5) is True
+        assert chain.verify_calls == 1
 
 
 class TestLoopLeavesFailedEpochsUnprocessed:
