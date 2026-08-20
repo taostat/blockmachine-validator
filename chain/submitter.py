@@ -61,16 +61,20 @@ class WeightSubmitter:
         # every cause of non-arrival (rate-limit rejection, network error,
         # a lying return value) presents identically as "not in storage",
         # so no failure classification is needed. Storage is checked in
-        # BOTH directions: a claimed rejection gets one read (nothing to
-        # wait for) so an SDK false NEGATIVE still marks a true success;
-        # a claimed success is polled to cover inclusion-read lag.
+        # BOTH directions: a claimed rejection gets two reads (a real
+        # rejection has nothing to wait for; the second read covers an
+        # SDK false NEGATIVE whose commit is still propagating) so a
+        # landed commit still marks a true success; a claimed success is
+        # polled longer to cover inclusion-read lag. A miss that slips
+        # both reads converges chain-side: the retry is either rejected
+        # by the rate limit or lands an identical-content duplicate.
         #
         # A false "not submitted" verdict only costs a retry, and retries
         # are chain-bounded twice over: inside the WeightsSetRateLimit
         # window a duplicate is rejected outright, and landed duplicates
         # are capped at 10 unrevealed commits per hotkey per epoch with
         # identical-content vectors, of which the last-decrypted wins.
-        attempts = _VERIFY_ATTEMPTS if claimed else 1
+        attempts = _VERIFY_ATTEMPTS if claimed else 2
         verified = await self._commit_landed_on_chain(since_block, attempts)
         if verified:
             if not claimed:
@@ -88,8 +92,14 @@ class WeightSubmitter:
         for attempt in range(attempts):
             if attempt:
                 await asyncio.sleep(_VERIFY_DELAY_SECS)
-            proof = await self.chain.verify_weight_commit_landed(since_block)
-            if proof is None:
+            try:
+                proof = await self.chain.verify_weight_commit_landed(since_block)
+            except Exception as e:
+                # submit() promises bool; a verifier that raises is a
+                # verifier that could not read.
+                logger.warning(f"Commit verification raised: {e}")
+                proof = None
+            if not isinstance(proof, dict):
                 could_not_read += 1
                 continue
             if proof.get("landed"):

@@ -192,12 +192,13 @@ class TestSubmitterVerifiesOnChain:
         assert chain.verify_calls == 2
 
     @pytest.mark.asyncio
-    async def test_a_rejected_claim_with_no_commit_fails_after_one_read(self):
-        # A claimed rejection gets a single storage read (nothing to wait
-        # for), not the full inclusion-lag poll.
+    async def test_a_rejected_claim_with_no_commit_fails_after_two_reads(self):
+        # A claimed rejection gets two storage reads (immediate + one
+        # block for a false-negative's propagation), not the full
+        # inclusion-lag poll.
         chain = _FakeChain(claimed=False, proofs=[ABSENT])
         assert await _submitter(chain).submit([(1, 0.5)], 0.5) is False
-        assert chain.verify_calls == 1
+        assert chain.verify_calls == 2
 
     @pytest.mark.asyncio
     async def test_an_sdk_false_negative_is_overruled_by_storage(self):
@@ -208,6 +209,23 @@ class TestSubmitterVerifiesOnChain:
         chain = _FakeChain(claimed=False, proofs=[LANDED])
         assert await _submitter(chain).submit([(1, 0.5)], 0.5) is True
         assert chain.verify_calls == 1
+
+
+class TestSubmitterContractHardening:
+    @pytest.mark.asyncio
+    async def test_a_raising_verifier_is_could_not_read_not_a_crash(self):
+        chain = _FakeChain(claimed=True)
+        async def boom(since_block):
+            raise RuntimeError("verifier bug")
+        chain.verify_weight_commit_landed = boom
+        # submit() promises bool: a broken verifier is fail-closed, not
+        # an exception into the weight loop.
+        assert await _submitter(chain).submit([(1, 0.5)], 0.5) is False
+
+    @pytest.mark.asyncio
+    async def test_a_non_dict_proof_is_could_not_read(self):
+        chain = _FakeChain(claimed=True, proofs=[True])  # truthy non-dict
+        assert await _submitter(chain).submit([(1, 0.5)], 0.5) is False
 
 
 class TestLoopLeavesFailedEpochsUnprocessed:

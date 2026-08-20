@@ -304,7 +304,6 @@ class BittensorChain:
                         res = await res
                     if res is not None and res.value:
                         raw.extend((ep, entry) for entry in res.value)
-                self._consecutive_failures = 0
 
             ss58 = self.hotkey.ss58_address
             pub = getattr(self.hotkey, "public_key", None)
@@ -323,6 +322,7 @@ class BittensorChain:
                 if not self._is_our_account(who, ss58, pub_hex):
                     continue
                 if int(commit_block) >= since_block:
+                    self._consecutive_failures = 0
                     return {
                         "landed": True,
                         "epoch": ep,
@@ -330,6 +330,7 @@ class BittensorChain:
                         "reveal_round": int(reveal_round),
                         "ct_len": self._ciphertext_len(ciphertext),
                     }
+            self._consecutive_failures = 0
             return {
                 "landed": False,
                 "epochs_checked": epochs,
