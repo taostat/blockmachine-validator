@@ -220,13 +220,145 @@ class BittensorChain:
             return None
 
     def _parse_chain_result(self, result, label: str) -> bool:
+        # bittensor >= 10 returns ExtrinsicResponse: tuple-LIKE (indexable,
+        # len() == 2) but NOT a tuple, and it defines __len__ without
+        # __bool__ — so bool(result) is ALWAYS True, success or not, and
+        # its `success` field even defaults to True. Read the verdict
+        # field; never the object's truthiness. (2026-08-20: a commit
+        # rejected inside the rate-limit window logged "submitted
+        # successfully" and the epoch was marked done with no retry.)
+        success = getattr(result, "success", None)
+        if success is not None:
+            if not success:
+                message = getattr(result, "message", None)
+                error = getattr(result, "error", None)
+                logger.error(f"{label} rejected: message={message!r} error={error!r}")
+            return bool(success)
         if isinstance(result, tuple):
             success = result[0]
             message = result[1] if len(result) > 1 else ""
             if not success:
                 logger.error(f"{label} rejected: {message}")
             return bool(success)
-        return bool(result)
+        if isinstance(result, bool):
+            return result
+        # An unrecognized response shape must never read as success —
+        # that is the exact defect this function had.
+        logger.error(
+            f"{label}: unrecognized chain result type "
+            f"{type(result).__name__}; treating as FAILURE"
+        )
+        return False
+
+    async def verify_weight_commit_landed(self, since_block: int) -> dict | None:
+        """Read TimelockedWeightCommits back from chain: did OUR commit land?
+
+        The SDK's return value is the submitter reporting on itself;
+        storage is the only proof. Three outcomes: landed / not landed /
+        None (the chain could not be read — absence of an answer is not
+        an answer, and the caller must not treat it as one).
+
+        Checks the current epoch AND current+1: a commit submitted on the
+        block where the epoch slot fires is tagged to the NEXT epoch by
+        the chain's lookahead, so checking only the current index yields
+        a false "didn't land" once per epoch. ``since_block`` scopes the
+        check to THIS submit — without it any older commit of ours
+        satisfies the read.
+
+        Presence is necessary, not sufficient: reveal_round and
+        ciphertext length are reported for cross-checking, but content
+        correctness is the reveal watcher's job, not this read's.
+
+        Storage key is [netuid_index, epoch] where netuid_index =
+        mechanism_id * GLOBAL_MAX_SUBNET_COUNT + netuid; for the main
+        mechanism (0) that is just the netuid.
+        """
+        # The whole body is fail-to-None: parsing a storage entry can
+        # raise just as a read can, and an exception here must become
+        # "could not verify", never bubble into the submit path (same
+        # exception scope as get_pending_weight_commits above).
+        try:
+            async with self._subtensor_lock:
+                await self._maybe_reconnect()
+                epoch_res = self.subtensor.substrate.query(
+                    "SubtensorModule", "SubnetEpochIndex", [self.netuid]
+                )
+                if asyncio.iscoroutine(epoch_res):
+                    epoch_res = await epoch_res
+                epoch = (
+                    int(epoch_res.value)
+                    if epoch_res is not None and epoch_res.value is not None
+                    else 0
+                )
+                # epoch-1 covers verification delayed across a rollover
+                # (the commit landed under the previous index); epoch+1
+                # covers the chain's lookahead tagging at a fire-block.
+                # since_block keeps all three honest.
+                epochs = [ep for ep in (epoch - 1, epoch, epoch + 1) if ep >= 0]
+                raw: list = []
+                for ep in epochs:
+                    res = self.subtensor.substrate.query(
+                        "SubtensorModule", "TimelockedWeightCommits", [self.netuid, ep]
+                    )
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    if res is not None and res.value:
+                        raw.extend((ep, entry) for entry in res.value)
+
+            ss58 = self.hotkey.ss58_address
+            pub = getattr(self.hotkey, "public_key", None)
+            pub_hex = (
+                pub.hex().lower() if isinstance(pub, (bytes, bytearray)) else None
+            )
+            for ep, entry in raw:
+                try:
+                    who, commit_block, ciphertext, reveal_round = entry
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"Unrecognized TimelockedWeightCommits entry shape: "
+                        f"{type(entry).__name__}"
+                    )
+                    continue
+                if not self._is_our_account(who, ss58, pub_hex):
+                    continue
+                if int(commit_block) >= since_block:
+                    self._consecutive_failures = 0
+                    return {
+                        "landed": True,
+                        "epoch": ep,
+                        "commit_block": int(commit_block),
+                        "reveal_round": int(reveal_round),
+                        "ct_len": self._ciphertext_len(ciphertext),
+                    }
+            self._consecutive_failures = 0
+            return {
+                "landed": False,
+                "epochs_checked": epochs,
+                "since_block": since_block,
+            }
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.warning(f"Could not verify TimelockedWeightCommits: {e}")
+            return None
+
+    @staticmethod
+    def _is_our_account(acct, ss58: str, pub_hex: str | None) -> bool:
+        # substrate-interface decodes AccountId32 as SS58 or raw hex
+        # depending on version/metadata; accept either representation.
+        s = str(acct)
+        if s == ss58:
+            return True
+        return pub_hex is not None and s.lower().removeprefix("0x") == pub_hex
+
+    @staticmethod
+    def _ciphertext_len(ciphertext) -> int | None:
+        if isinstance(ciphertext, str):
+            h = ciphertext.removeprefix("0x")
+            return len(h) // 2
+        try:
+            return len(ciphertext)
+        except TypeError:
+            return None
 
     def get_subtensor(self) -> Any:
         return self.subtensor

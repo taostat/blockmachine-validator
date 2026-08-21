@@ -262,9 +262,17 @@ class WeightLoop:
                 f"(no gateway activity) — submitting burn directly"
             )
             submitted = await self._submit_direct([], 1.0)
-            if submitted:
-                self._last_submitted_block = await self.chain.get_current_block()
-            await self.store.mark_epoch_processed(epoch_id, weights_submitted=submitted)
+            if not submitted:
+                # A failed submit must leave the epoch UNPROCESSED so the
+                # next cycle retries it — marking it here is what turned a
+                # transient rejection into a permanently missed weight-set.
+                logger.error(
+                    f"Epoch {epoch_id}: declared-burn submission failed — "
+                    f"leaving epoch unprocessed for retry"
+                )
+                return False
+            self._last_submitted_block = await self.chain.get_current_block()
+            await self.store.mark_epoch_processed(epoch_id, weights_submitted=True)
             return True
 
         if manifest:
@@ -292,11 +300,19 @@ class WeightLoop:
             logger.warning(
                 f"No CU allocations for {epoch_id} after {elapsed:.0f}s, submitting 100% burn"
             )
-            self._cu_retry_start.pop(epoch_id, None)
             submitted = await self._submit_direct([], 1.0)
-            if submitted:
-                self._last_submitted_block = await self.chain.get_current_block()
-            await self.store.mark_epoch_processed(epoch_id, weights_submitted=submitted)
+            if not submitted:
+                # Timer deliberately NOT popped: elapsed already exceeds the
+                # timeout, so the retry next cycle goes straight to submit
+                # instead of waiting another 30 minutes.
+                logger.error(
+                    f"Epoch {epoch_id}: CU-timeout burn submission failed — "
+                    f"leaving epoch unprocessed for retry"
+                )
+                return False
+            self._cu_retry_start.pop(epoch_id, None)
+            self._last_submitted_block = await self.chain.get_current_block()
+            await self.store.mark_epoch_processed(epoch_id, weights_submitted=True)
             return True
 
         self._cu_retry_start.pop(epoch_id, None)
@@ -406,7 +422,7 @@ class WeightLoop:
             uid_map,
             submitted,
         )
-        return True
+        return submitted
 
     async def _submit_direct(
         self,
@@ -426,9 +442,20 @@ class WeightLoop:
         uid_map: dict,
         submitted: bool,
     ):
+        if not submitted:
+            # A failed submit must leave the epoch UNPROCESSED (no audit,
+            # no mark, no tempo-guard arming) so the next cycle retries.
+            # If a newer epoch finalizes first, the normal skip logic
+            # supersedes this one — that is the retry bound.
+            logger.error(
+                f"Epoch {epoch_id}: weights NOT submitted — leaving epoch "
+                f"unprocessed; it will be retried next cycle until it "
+                f"succeeds or a newer epoch supersedes it"
+            )
+            return
+
         block = await self.chain.get_current_block()
-        if submitted:
-            self._last_submitted_block = block
+        self._last_submitted_block = block
 
         miners_paid = sum(1 for m in weights_result.miners if m.weight > 0)
         miners_banned = sum(1 for m in weights_result.miners if m.is_banned)
