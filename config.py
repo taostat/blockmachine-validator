@@ -80,8 +80,19 @@ class WeightConfig:
     #   A commit sent with no runway cannot clear the offset and is
     #   arithmetically certain to miss its boundary.
     # `reveal_margin_secs`: aim this far before the EARLIEST possible
-    #   boundary. This is the whole safety margin; it is also exactly the
+    #   boundary. This is the whole safety margin; it is also roughly the
     #   minimum time the ciphertext is decryptable early.
+    #
+    #   45s, NOT 15s, and the reason is two effects the block count hides.
+    #   The library adds its predicted duration to WALL-CLOCK NOW, but the
+    #   prediction is in whole blocks, so being partway through the current
+    #   block silently eats up to one block (12s) of the margin. And a pulse
+    #   has to be in `Drand::LastStoredRound` before the reveal runs, which
+    #   wants it published at least a block ahead rather than merely before
+    #   the boundary block. 15s covered neither and could land inside a
+    #   single drand round of the boundary; 45s leaves at least 2.7 blocks
+    #   of lead in the worst intra-block case. Raised after codex reproduced
+    #   the shortfall against this diff.
     # `block_time_floor_secs`: the hard lower bound on mainnet block time.
     #   Measured over 30 days / 88 rolling 7200-block windows: minimum
     #   12.000000 s/block, integer-exact, never below. Aiming at the floor
@@ -90,7 +101,7 @@ class WeightConfig:
     #   guarantee; lowering it only costs exposure.
     commit_window_blocks: int = 200
     commit_min_runway_blocks: int = 20
-    reveal_margin_secs: float = 15.0
+    reveal_margin_secs: float = 45.0
     block_time_floor_secs: float = 12.0
 
 

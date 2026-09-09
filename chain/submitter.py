@@ -18,6 +18,12 @@ _VERIFY_DELAY_SECS = 12.0
 class WeightSubmitter:
     def __init__(self, chain: ChainInterface, weights_config: WeightConfig):
         self.chain = chain
+        # The block the last verified commit was INCLUDED at, straight from
+        # the storage read that proved it. Not the block we finished
+        # verifying at: verification polls for up to a minute, so those two
+        # can sit on opposite sides of an epoch boundary, and the caller
+        # dedupes commits per epoch off this value.
+        self.last_commit_block: int | None = None
         # Held by reference so registry-driven hot-reloads of burn_sink_uid
         # take effect on the next submit() without a process restart.
         self._weights = weights_config
@@ -85,7 +91,15 @@ class WeightSubmitter:
         # are capped at 10 unrevealed commits per hotkey per epoch with
         # identical-content vectors, of which the last-decrypted wins.
         attempts = _VERIFY_ATTEMPTS if claimed else 2
+        self.last_commit_block = None
         verified = await self._commit_landed_on_chain(since_block, attempts)
+        if verified and self.last_commit_block is None:
+            # Verified but the proof carried no block: fall back to the block
+            # sampled BEFORE the submit, which is never later than inclusion.
+            # Recording a later block is what suppresses the next epoch's
+            # commit; recording an earlier one only risks a duplicate that
+            # the chain's own rate limit rejects.
+            self.last_commit_block = since_block
         if verified:
             if not claimed:
                 logger.warning(
@@ -113,6 +127,10 @@ class WeightSubmitter:
                 could_not_read += 1
                 continue
             if proof.get("landed"):
+                commit_block = proof.get("commit_block")
+                self.last_commit_block = (
+                    int(commit_block) if commit_block is not None else None
+                )
                 logger.info(
                     f"Commit verified on chain: epoch={proof.get('epoch')} "
                     f"block={proof.get('commit_block')} "

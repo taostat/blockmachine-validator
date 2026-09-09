@@ -67,6 +67,7 @@ BLOCK_TIME_FLOOR = 12.000
 # The slowest 7200-block window in 30 days of mainnet; the fastest was exactly
 # the floor, 12.000000, integer-exact, and nothing was ever below it.
 BLOCK_TIME_OBSERVED_MAX = 12.038333
+DEFAULT_MARGIN = 45.0
 
 
 class FakeChain:
@@ -592,3 +593,107 @@ def test_the_probe_schedule_is_self_consistent():
     assert seen["current_block"] - seen["last_epoch_block"] == seen[
         "blocks_since_last_step"
     ], "the probe told the library two different things about its own schedule"
+
+# ---------------------------------------------------------------------------
+# 9. the two P1s codex found against this diff
+# ---------------------------------------------------------------------------
+
+
+def test_a_commit_confirmed_after_the_boundary_does_not_suppress_the_next_one():
+    """CODEX P1, AND IT IS THE SAME MONEY BUG THROUGH A DIFFERENT DOOR.
+
+    `submit` polls storage for up to a minute to prove the commit landed, so
+    a commit INCLUDED at B-1 can be CONFIRMED at B+1. Recording the
+    confirmation block made the per-epoch guard read "already committed this
+    epoch" for the whole of the new epoch — no commit went out, and at the
+    following boundary the real LastUpdate was over the activity cutoff and
+    dividends were zero.
+    """
+    class SubmitterWithProof:
+        last_commit_block = BOUNDARY - 1  # included just before the boundary
+
+    chain = FakeChain(block=BOUNDARY + 100, last_epoch_block=BOUNDARY)
+    loop = loop_with(chain, commit_window_blocks=0)
+    loop.submitter = SubmitterWithProof()
+    loop._last_submitted_block = run(loop._commit_block())
+    assert loop._last_submitted_block == BOUNDARY - 1, (
+        "recorded the confirmation block instead of the inclusion block"
+    )
+    assert run(loop._ready_to_commit()) is True, (
+        "a commit from the previous epoch suppressed this epoch's commit — "
+        "that is a full epoch of dividends"
+    )
+
+
+def test_the_commit_block_falls_back_when_no_proof_carries_one():
+    class NoProof:
+        last_commit_block = None
+
+    chain = FakeChain(block=BOUNDARY - 10)
+    loop = loop_with(chain)
+    loop.submitter = NoProof()
+    assert run(loop._commit_block()) == BOUNDARY - 10
+
+
+def test_the_submitter_records_the_verified_inclusion_block():
+    chain = FakeChain(block=BOUNDARY - 5)
+
+    class ProvingChain(FakeChain):
+        async def verify_weight_commit_landed(self, since_block):
+            return {"landed": True, "commit_block": BOUNDARY - 6}
+
+    chain = ProvingChain(block=BOUNDARY - 5)
+    submitter = WeightSubmitter(chain, ValidatorConfig().weights)
+    assert run(submitter.submit([(1, 0.5)], 0.5)) is True
+    assert submitter.last_commit_block == BOUNDARY - 6
+
+
+def test_a_verified_commit_with_no_block_in_the_proof_uses_the_presubmit_block():
+    """Never later than inclusion. Recording a later block suppresses the
+    next epoch's commit; an earlier one only risks a duplicate the chain's
+    own rate limit rejects."""
+    class VagueChain(FakeChain):
+        async def verify_weight_commit_landed(self, since_block):
+            return {"landed": True}
+
+    chain = VagueChain(block=BOUNDARY - 5)
+    submitter = WeightSubmitter(chain, ValidatorConfig().weights)
+    assert run(submitter.submit([(1, 0.5)], 0.5)) is True
+    assert submitter.last_commit_block == BOUNDARY - 5
+
+
+def test_the_margin_covers_a_whole_block_of_intra_block_elapsed_time():
+    """CODEX P1. The library adds its predicted duration to wall-clock NOW,
+    but predicts in whole blocks — so being partway through the current block
+    silently eats up to 12s of margin. And the pulse must reach
+    `Drand::LastStoredRound` before the reveal runs, which wants it published
+    a block ahead rather than merely before the boundary block. 15s covered
+    neither and could land inside one drand round of the boundary."""
+    assert ValidatorConfig().weights.reveal_margin_secs >= 36.0, (
+        "the margin no longer covers one block of intra-block drift plus a "
+        "block of ingestion lead"
+    )
+    for remaining in (200, 20):
+        chain = FakeChain(block=BOUNDARY - remaining)
+        loop = loop_with(chain)
+        bt = run(loop._reveal_block_time())
+        aimed = aimed_seconds(bt, remaining)
+        # Worst case: we sampled the block 11.9s ago, so the boundary is that
+        # much nearer in wall-clock than the block count implies.
+        lead = (remaining * BLOCK_TIME_FLOOR - 11.9) - aimed
+        assert lead >= 12.0, (
+            f"{remaining} blocks out: only {lead:.1f}s of lead in the worst "
+            "intra-block case — under one block, so the pulse may not be "
+            "ingested before the reveal runs"
+        )
+
+
+def test_exposure_is_still_under_a_minute_at_the_commit_window():
+    """The larger margin is bought with exposure, and Ben accepted ~1 minute.
+    This pins that the trade did not quietly get worse."""
+    remaining = 200
+    chain = FakeChain(block=BOUNDARY - remaining)
+    loop = loop_with(chain)
+    bt = run(loop._reveal_block_time())
+    exposure = remaining * BLOCK_TIME_OBSERVED_MAX - aimed_seconds(bt, remaining)
+    assert exposure < 60.0, f"exposure grew to {exposure:.0f}s"

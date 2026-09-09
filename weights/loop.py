@@ -390,6 +390,28 @@ class WeightLoop:
     def _weights_cfg(self):
         return self.config.weights
 
+    async def _commit_block(self) -> int:
+        """The block our commit was INCLUDED at, not the block we finished
+        confirming it at.
+
+        These differ, and the difference costs an epoch of income. `submit`
+        polls storage for up to a minute to prove the commit landed, so a
+        commit included at B-1 can be confirmed at B+1 — the far side of a
+        boundary. Recording the confirmation block then tells the per-epoch
+        guard "already committed this epoch" for the whole of the NEW epoch,
+        no commit goes out, and at the following boundary the real
+        `LastUpdate` is over the activity cutoff and dividends are zero. That
+        is the same failure the never-skip rule exists to prevent, arriving
+        through a different door — found by codex against this diff.
+
+        Falls back to the current block only when the submitter has no
+        verified block to offer.
+        """
+        block = getattr(self.submitter, "last_commit_block", None)
+        if isinstance(block, int):
+            return block
+        return await self.chain.get_current_block()
+
     async def _reveal_block_time(self) -> float | None:
         """The ``block_time`` to hand the SDK so its reveal round lands just
         BEFORE the earliest the boundary can arrive.
@@ -521,7 +543,7 @@ class WeightLoop:
                     f"leaving epoch unprocessed for retry"
                 )
                 return False
-            self._last_submitted_block = await self.chain.get_current_block()
+            self._last_submitted_block = await self._commit_block()
             await self.store.mark_epoch_processed(epoch_id, weights_submitted=True)
             return True
 
@@ -561,7 +583,7 @@ class WeightLoop:
                 )
                 return False
             self._cu_retry_start.pop(epoch_id, None)
-            self._last_submitted_block = await self.chain.get_current_block()
+            self._last_submitted_block = await self._commit_block()
             await self.store.mark_epoch_processed(epoch_id, weights_submitted=True)
             return True
 
@@ -706,7 +728,7 @@ class WeightLoop:
             )
             return
 
-        block = await self.chain.get_current_block()
+        block = await self._commit_block()
         self._last_submitted_block = block
 
         miners_paid = sum(1 for m in weights_result.miners if m.weight > 0)
