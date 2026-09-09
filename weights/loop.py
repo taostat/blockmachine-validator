@@ -29,8 +29,86 @@ _CU_RETRY_TIMEOUT = 1800  # 30 min
 # drand round (`SECURITY_BLOCK_OFFSET` in bittensor's weight extrinsic). It is
 # unconditional, so the round it picks is always this far PAST the boundary
 # unless the caller compensates. Measured on mainnet as +2.8 blocks at every
-# commit position; 3 is the constant in the SDK and the value to divide by.
+# commit position, and 3 is the value in the SDK today.
+#
+# THIS IS A FALLBACK, NOT THE SOURCE OF TRUTH. The margin degrades ~12s per
+# unit of offset error: at 4 it drops to +3s, at 5 it is -9s and the fix is
+# gone — silently, with no error and no log line, on a dependency bump we
+# did not audit. `measure_reveal_offset_blocks` derives the real value from
+# the installed library instead, and this constant is only used when that
+# cannot be done.
 _SDK_REVEAL_OFFSET_BLOCKS = 3
+
+
+def measure_reveal_offset_blocks() -> int:
+    """The offset the INSTALLED drand library actually applies.
+
+    Derived rather than trusted. The round it returns is
+    ``round_at(now + (blocks_remaining + offset) * block_time)``, so calling
+    it twice with the same schedule and two different ``block_time`` values
+    cancels everything except the offset:
+
+        (r1 - r2) * seconds_per_round = (remaining + offset) * (bt1 - bt2)
+
+    Purely local — no network, no chain, no extrinsic — so it is cheap enough
+    to do once per process. Any failure, or a result outside a sane range,
+    falls back to the compiled-in constant rather than shipping a margin
+    computed from nonsense.
+    """
+    seconds_per_round = 3.0
+    # The probe schedule must be SELF-CONSISTENT: the library reads both
+    # `blocks_since_last_step` and `current_block - last_epoch_block`, and
+    # feeding it two different answers to the same question produced a
+    # derived offset of 1004 blocks on the first attempt here.
+    tempo = 7200
+    blocks_since = 7000
+    last_epoch_block = 9_000_000
+    remaining = tempo - blocks_since
+    bt1, bt2 = 12.0, 6.0
+    try:
+        from bittensor_drand import get_encrypted_commit_v2
+
+        rounds = []
+        for bt in (bt1, bt2):
+            _commit, target = get_encrypted_commit_v2(
+                uids=[0],
+                weights=[1],
+                version_key=0,
+                last_epoch_block=last_epoch_block,
+                pending_epoch_at=0,
+                subnet_epoch_index=1,
+                tempo=tempo,
+                blocks_since_last_step=blocks_since,
+                current_block=last_epoch_block + blocks_since,
+                subnet_reveal_period_epochs=1,
+                block_time=bt,
+                hotkey=bytes(32),
+            )
+            rounds.append(int(target))
+        offset = round(
+            (rounds[0] - rounds[1]) * seconds_per_round / (bt1 - bt2) - remaining
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not measure the SDK reveal offset ({e}); falling back to "
+            f"{_SDK_REVEAL_OFFSET_BLOCKS} blocks"
+        )
+        return _SDK_REVEAL_OFFSET_BLOCKS
+    if not 0 <= offset <= 20:
+        logger.warning(
+            f"Measured an implausible SDK reveal offset ({offset} blocks); "
+            f"falling back to {_SDK_REVEAL_OFFSET_BLOCKS}"
+        )
+        return _SDK_REVEAL_OFFSET_BLOCKS
+    if offset != _SDK_REVEAL_OFFSET_BLOCKS:
+        logger.warning(
+            f"The installed drand library offsets its reveal target by "
+            f"{offset} blocks, not the {_SDK_REVEAL_OFFSET_BLOCKS} this code "
+            "was written against — using the measured value"
+        )
+    else:
+        logger.info(f"SDK reveal offset measured at {offset} blocks")
+    return offset
 
 
 class WeightLoop:
@@ -58,6 +136,7 @@ class WeightLoop:
         self._last_update_block: int | None = None
         self._session_commits: dict[str, dict] = {}
         self._commits_initialized = False
+        self._reveal_offset_blocks: int | None = None
 
     async def run(self):
         self.running = True
@@ -280,13 +359,32 @@ class WeightLoop:
 
         floor = self._weights_cfg().commit_min_runway_blocks
         if blocks_to_boundary < floor:
+            # SEND IT ANYWAY. An earlier version of this returned False here,
+            # reasoning that a commit which cannot be decrypted in time is
+            # wasted and the previous vector stays in `Weights` regardless.
+            # That reasoning is wrong and the cost is a full epoch of income.
+            #
+            # `LastUpdate` is written at COMMIT time and, on a commit-reveal
+            # subnet, the commit is its only writer — the reveal never touches
+            # it. The epoch marks a validator inactive when
+            # `last_update + activity_cutoff < current_block`, where the
+            # cutoff is `ActivityCutoffFactorMilli * tempo / 1000` — one whole
+            # tempo on netuid 19. Committing once per epoch puts consecutive
+            # commits exactly one tempo apart, which is inside the cutoff with
+            # room to spare; SKIP one and the gap doubles, the validator is
+            # masked out of `active_stake` (run_epoch.rs), and its dividends
+            # for that epoch are zero. Confirmed on chain: the one validator
+            # with `active=false` also has dividends of exactly 0.
+            #
+            # So the two outcomes are not comparable. A commit that misses its
+            # reveal costs one stale epoch. A commit never sent costs the
+            # epoch's entire income.
             logger.warning(
-                f"Only {blocks_to_boundary} blocks to the boundary (need "
-                f"{floor}) — a commit now cannot be decrypted in time, so "
-                "skipping to the next epoch rather than sending one that is "
-                "certain to miss"
+                f"Only {blocks_to_boundary} blocks to the boundary (wanted "
+                f"{floor}) — committing anyway: the reveal will probably land "
+                "one epoch late, but skipping would let LastUpdate age past "
+                "the activity cutoff and zero this validator's dividends"
             )
-            return False
         return True
 
     def _weights_cfg(self):
@@ -321,7 +419,9 @@ class WeightLoop:
         aimed = blocks_to_boundary * cfg.block_time_floor_secs - cfg.reveal_margin_secs
         if aimed <= 0:
             return None
-        block_time = aimed / (blocks_to_boundary + _SDK_REVEAL_OFFSET_BLOCKS)
+        if self._reveal_offset_blocks is None:
+            self._reveal_offset_blocks = measure_reveal_offset_blocks()
+        block_time = aimed / (blocks_to_boundary + self._reveal_offset_blocks)
         if block_time <= 0:
             return None
         logger.info(

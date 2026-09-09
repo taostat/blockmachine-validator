@@ -200,15 +200,47 @@ def test_a_window_of_zero_disables_holding():
     assert run(loop._ready_to_commit()) is True
 
 
-def test_a_commit_certain_to_miss_is_not_sent():
-    """With no runway the reveal round cannot clear the SDK's offset, so the
-    commit is arithmetically certain to miss its boundary. The previous vector
-    stays in storage either way, so sending it gains nothing."""
-    chain = FakeChain(block=BOUNDARY - 5)
-    loop = loop_with(chain, commit_min_runway_blocks=20)
-    assert run(loop._ready_to_commit()) is False
-    chain.block = BOUNDARY - 20
-    assert run(loop._ready_to_commit()) is True
+def test_a_late_commit_is_still_sent_because_skipping_costs_the_epoch():
+    """THE BUG THIS ALMOST SHIPPED WITH.
+
+    The first version refused to commit with too little runway, reasoning
+    that the commit could not be decrypted in time and the previous vector
+    stayed in `Weights` anyway. That reasoning ignores the activity cutoff.
+
+    `LastUpdate` is written at COMMIT time and the reveal never touches it,
+    so on a commit-reveal subnet it IS the last commit block. The epoch marks
+    a validator inactive when `last_update + activity_cutoff < current_block`,
+    and the cutoff is one whole tempo. Committing once per epoch keeps
+    consecutive commits one tempo apart, comfortably inside it. Skip one and
+    the gap doubles: the validator is masked out of `active_stake` and earns
+    NOTHING for that epoch.
+
+    A late commit costs one stale epoch. A skipped commit costs the epoch's
+    entire income. Never skip.
+    """
+    for remaining in (5, 1, 19):
+        chain = FakeChain(block=BOUNDARY - remaining)
+        loop = loop_with(chain, commit_min_runway_blocks=20)
+        assert run(loop._ready_to_commit()) is True, (
+            f"refused to commit with {remaining} blocks left — that skips an "
+            "epoch and zeroes this validator's dividends"
+        )
+
+
+def test_the_normal_cadence_stays_inside_the_activity_cutoff():
+    """One commit per epoch at a fixed offset puts consecutive commits exactly
+    one tempo apart, and the cutoff is one tempo — so the margin is the offset
+    itself. Committing 200 blocks before the boundary leaves 7,000 blocks of
+    margin; committing right after the boundary would leave 32."""
+    cutoff = TEMPO  # ActivityCutoffFactorMilli(1000) * tempo / 1000
+    for window in (200, 600):
+        commit_at = BOUNDARY - window
+        age_at_next_boundary = (BOUNDARY + TEMPO) - (commit_at + TEMPO)
+        assert age_at_next_boundary == window
+        assert commit_at + cutoff >= BOUNDARY, (
+            "this cadence would be judged inactive at its own boundary"
+        )
+        assert cutoff - age_at_next_boundary >= TEMPO - 600
 
 
 # ---------------------------------------------------------------------------
@@ -452,3 +484,111 @@ def test_both_submit_paths_compute_a_reveal_round():
     chain.set_weights_calls.clear()
     run(loop._submit_with_retry([(1, 0.5)], 0.5))
     assert chain.set_weights_calls and chain.set_weights_calls[-1] is not None
+
+# ---------------------------------------------------------------------------
+# 8. the SDK offset is measured, not trusted
+# ---------------------------------------------------------------------------
+
+
+def _fake_drand(offset, constant_round=False):
+    """A stand-in for bittensor_drand whose offset we choose."""
+    mod = types.ModuleType("bittensor_drand")
+
+    def get_encrypted_commit_v2(**kw):
+        if constant_round:
+            return b"", 1_000_000
+        remaining = kw["tempo"] - kw["blocks_since_last_step"]
+        seconds = (remaining + offset) * kw["block_time"]
+        return b"", int(1_000_000 + seconds / 3.0)
+
+    mod.get_encrypted_commit_v2 = get_encrypted_commit_v2
+    return mod
+
+
+def _with_drand(mod):
+    saved = sys.modules.get("bittensor_drand")
+    if mod is None:
+        sys.modules.pop("bittensor_drand", None)
+    else:
+        sys.modules["bittensor_drand"] = mod
+    return saved
+
+
+def test_the_offset_is_derived_from_the_installed_library():
+    """The margin degrades ~12s per unit of offset error: at 4 it is +3s, at
+    5 it is -9s and the fix is gone — silently, on a dependency bump nobody
+    audited. So the value is measured, not compiled in."""
+    from validator.weights.loop import measure_reveal_offset_blocks
+
+    saved = _with_drand(_fake_drand(offset=7))
+    try:
+        assert measure_reveal_offset_blocks() == 7
+    finally:
+        _with_drand(saved)
+
+
+def test_an_implausible_measurement_falls_back_to_the_constant():
+    """A margin computed from nonsense is worse than the known constant."""
+    from validator.weights.loop import (
+        measure_reveal_offset_blocks,
+        _SDK_REVEAL_OFFSET_BLOCKS,
+    )
+
+    saved = _with_drand(_fake_drand(offset=0, constant_round=True))
+    try:
+        assert measure_reveal_offset_blocks() == _SDK_REVEAL_OFFSET_BLOCKS
+    finally:
+        _with_drand(saved)
+
+
+def test_a_missing_library_falls_back_to_the_constant():
+    from validator.weights.loop import (
+        measure_reveal_offset_blocks,
+        _SDK_REVEAL_OFFSET_BLOCKS,
+    )
+
+    saved = _with_drand(None)
+    try:
+        assert measure_reveal_offset_blocks() == _SDK_REVEAL_OFFSET_BLOCKS
+    finally:
+        _with_drand(saved)
+
+
+def test_the_measured_offset_is_the_one_the_solve_uses():
+    """Measuring it and then not using it would be the same bug with extra
+    steps."""
+    remaining = 200
+    chain = FakeChain(block=BOUNDARY - remaining)
+    loop = loop_with(chain, reveal_margin_secs=15.0)
+    loop._reveal_offset_blocks = 9
+    bt = run(loop._reveal_block_time())
+    aimed = 200 * BLOCK_TIME_FLOOR - 15.0
+    assert abs(bt - aimed / (remaining + 9)) < 1e-9, (
+        "the solve is not dividing by the measured offset"
+    )
+
+
+def test_the_probe_schedule_is_self_consistent():
+    """The library reads both `blocks_since_last_step` and
+    `current_block - last_epoch_block`. Feeding it two different answers to
+    the same question derived an offset of 1004 blocks on the first attempt."""
+    seen = {}
+
+    mod = types.ModuleType("bittensor_drand")
+
+    def get_encrypted_commit_v2(**kw):
+        seen.update(kw)
+        remaining = kw["tempo"] - kw["blocks_since_last_step"]
+        return b"", int(1_000_000 + (remaining + 3) * kw["block_time"] / 3.0)
+
+    mod.get_encrypted_commit_v2 = get_encrypted_commit_v2
+    from validator.weights.loop import measure_reveal_offset_blocks
+
+    saved = _with_drand(mod)
+    try:
+        measure_reveal_offset_blocks()
+    finally:
+        _with_drand(saved)
+    assert seen["current_block"] - seen["last_epoch_block"] == seen[
+        "blocks_since_last_step"
+    ], "the probe told the library two different things about its own schedule"
