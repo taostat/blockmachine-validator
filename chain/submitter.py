@@ -26,8 +26,14 @@ class WeightSubmitter:
         self,
         miner_weights: list[tuple[int, float]],
         burn_weight: float,
+        block_time: float | None = None,
     ) -> bool:
-        """Normalize and submit weights to chain. Returns True on success."""
+        """Normalize and submit weights to chain. Returns True on success.
+
+        ``block_time`` steers which drand round the commit targets; the
+        caller recomputes it per attempt from the remaining runway. ``None``
+        leaves the SDK's default, which aims past the boundary.
+        """
         burn_sink_uid = self._weights.burn_sink_uid
         all_weights = list(miner_weights)
         if burn_weight > 0:
@@ -51,7 +57,11 @@ class WeightSubmitter:
             # Captured BEFORE the submit so the chain read below answers
             # "did THIS submit land", not "have we ever committed".
             since_block = await self.chain.get_current_block()
-            claimed = await self.chain.set_weights(uids, values)
+            # Passed only when we actually computed one: a ChainInterface
+            # that predates this keyword (or a test double) must keep
+            # working, and `None` carries no information the callee needs.
+            extra = {} if block_time is None else {"block_time": block_time}
+            claimed = await self.chain.set_weights(uids, values, **extra)
         except Exception as e:
             logger.error(f"Weight submission error: {e}")
             return False
@@ -128,8 +138,29 @@ class WeightSubmitter:
         return False
 
     async def blocks_until_next_epoch(self) -> int:
+        """Blocks until the chain's next epoch boundary.
+
+        Anchored on ``LastEpochBlock``, not on ``block % tempo``: the lattice
+        is anchored at block 0 and the chain's boundary is a stateful counter
+        that has drifted off it, so the old arithmetic could report 200
+        blocks left with 3,500 to go, or the reverse. Callers use this to
+        decide whether there is time to retry, so being wrong here abandons
+        submissions that had hours in hand.
+
+        Falls back to the lattice only when the anchor cannot be read, and
+        clamps at 0 so a caller never sees a negative runway.
+        """
         block = await self.chain.get_current_block()
         tempo = await self.chain.get_tempo()
-        if tempo == 0:
+        if tempo <= 0:
             return 0
-        return tempo - (block % tempo)
+        last_epoch_block = None
+        getter = getattr(self.chain, "get_last_epoch_block", None)
+        if getter is not None:
+            try:
+                last_epoch_block = await getter()
+            except Exception as e:
+                logger.warning(f"Could not read the epoch anchor: {e}")
+        if last_epoch_block is None:
+            return tempo - (block % tempo)
+        return max(0, last_epoch_block + tempo - block)

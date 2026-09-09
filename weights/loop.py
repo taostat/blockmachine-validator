@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 _CU_RETRY_TIMEOUT = 1800  # 30 min
 
+# The SDK adds this many blocks to its predicted boundary before choosing a
+# drand round (`SECURITY_BLOCK_OFFSET` in bittensor's weight extrinsic). It is
+# unconditional, so the round it picks is always this far PAST the boundary
+# unless the caller compensates. Measured on mainnet as +2.8 blocks at every
+# commit position; 3 is the constant in the SDK and the value to divide by.
+_SDK_REVEAL_OFFSET_BLOCKS = 3
+
 
 class WeightLoop:
     def __init__(
@@ -156,20 +163,8 @@ class WeightLoop:
                                 f"expires in {blocks_until_expiry} blocks"
                             )
 
-        # tempo guard: don't submit more than once per tempo window
-        if self._last_submitted_block is not None:
-            current_block = await self.chain.get_current_block()
-            tempo = await self.chain.get_tempo()
-            if tempo > 0:
-                last_window = self._last_submitted_block // tempo
-                current_window = current_block // tempo
-                if last_window == current_window:
-                    blocks_left = tempo - (current_block % tempo)
-                    logger.info(
-                        f"Already submitted this tempo window, "
-                        f"{blocks_left} blocks until next window (tempo={tempo})"
-                    )
-                    return
+        if not await self._ready_to_commit():
+            return
 
         latest = await self._find_latest_unprocessed_epoch()
         if latest is None:
@@ -180,6 +175,161 @@ class WeightLoop:
 
         epoch_id, miner_configs, manifest, price_snapshot = latest
         await self._process_epoch(epoch_id, miner_configs, manifest, price_snapshot)
+
+    async def _schedule(self) -> "tuple[int, int, int] | None":
+        """``(current_block, tempo, last_epoch_block)`` from the chain's own
+        epoch clock, or ``None`` if that clock could not be read.
+
+        The anchor is returned raw rather than as a gap: callers need both
+        "when did this epoch begin" (to dedupe a commit) and "how long until
+        it ends" (to time one), and deriving either from the other is how a
+        sign error hides.
+        """
+        try:
+            current_block = await self.chain.get_current_block()
+            tempo = await self.chain.get_tempo()
+            getter = getattr(self.chain, "get_last_epoch_block", None)
+            if getter is None:
+                logger.debug("Chain interface exposes no epoch anchor")
+                return None
+            last_epoch_block = await getter()
+        except Exception as e:
+            # Any failure to read the clock is "no clock", never a boundary:
+            # the caller falls back to a conservative rolling cadence. This
+            # also keeps a chain implementation that predates these reads
+            # from taking the whole weight loop down.
+            logger.warning(f"Could not read the epoch schedule: {e}")
+            return None
+        if tempo is None or tempo <= 0 or last_epoch_block is None:
+            return None
+        return current_block, tempo, last_epoch_block
+
+    async def _ready_to_commit(self) -> bool:
+        """One commit per CHAIN epoch, inside the commit window.
+
+        Three separate jobs, all previously done by `block // tempo`:
+
+        1. **Don't commit twice for the same epoch.** Keyed off the chain's
+           boundary, so it means what it says. The old lattice was anchored
+           at block 0 and had drifted 3,329 blocks (~11h) from the real
+           boundary, which meant a validator's commit time was decided by
+           where its lattice line fell rather than by the epoch — and once
+           out of phase it stayed out, because the guard just repeated the
+           same 7200-block cadence forever.
+
+        2. **Hold until the boundary is close.** Freshness costs nothing:
+           every commit inside an epoch is keyed to that epoch and drains at
+           the same boundary, so committing later applies the same data at the
+           same time. What it buys is a shorter horizon, and the horizon is
+           what decides how long the ciphertext sits publicly decryptable
+           before the epoch closes (that window is the accumulated block-time
+           drift over the horizon). 200 blocks keeps it to ~20-30s while
+           still leaving 40 minutes of retries.
+
+        3. **Refuse when the runway is too short to land.** With less than a
+           few blocks of horizon the reveal round cannot clear the SDK's
+           offset, so the commit is arithmetically certain to miss its
+           boundary. Skipping costs nothing that sending would have gained:
+           the previous vector stays in storage either way, and the next
+           window is one epoch later in both cases.
+
+        With the chain clock unreadable, falls back to a ROLLING one-per-tempo
+        rule. That is the old cadence without the phase lock, and it is the
+        conservative direction: it can delay a commit, never duplicate one.
+        """
+        sched = await self._schedule()
+        if sched is None:
+            if self._last_submitted_block is None:
+                return True
+            try:
+                current_block = await self.chain.get_current_block()
+                tempo = await self.chain.get_tempo()
+            except Exception as e:
+                logger.warning(f"Could not read the chain clock: {e}")
+                return True
+            if tempo and tempo > 0 and current_block - self._last_submitted_block < tempo:
+                logger.info(
+                    "Epoch anchor unreadable; holding off — last submit was "
+                    f"{current_block - self._last_submitted_block} blocks ago "
+                    f"(tempo={tempo})"
+                )
+                return False
+            return True
+
+        current_block, tempo, last_epoch_block = sched
+        blocks_to_boundary = last_epoch_block + tempo - current_block
+
+        if (
+            self._last_submitted_block is not None
+            and self._last_submitted_block >= last_epoch_block
+        ):
+            logger.info(
+                "Already committed this epoch (submitted at block "
+                f"{self._last_submitted_block}, epoch began {last_epoch_block}); "
+                f"next boundary in {blocks_to_boundary} blocks"
+            )
+            return False
+
+        window = self._weights_cfg().commit_window_blocks
+        if window > 0 and blocks_to_boundary > window:
+            logger.info(
+                f"Holding the commit: {blocks_to_boundary} blocks to the "
+                f"boundary, committing inside the last {window}"
+            )
+            return False
+
+        floor = self._weights_cfg().commit_min_runway_blocks
+        if blocks_to_boundary < floor:
+            logger.warning(
+                f"Only {blocks_to_boundary} blocks to the boundary (need "
+                f"{floor}) — a commit now cannot be decrypted in time, so "
+                "skipping to the next epoch rather than sending one that is "
+                "certain to miss"
+            )
+            return False
+        return True
+
+    def _weights_cfg(self):
+        return self.config.weights
+
+    async def _reveal_block_time(self) -> float | None:
+        """The ``block_time`` to hand the SDK so its reveal round lands just
+        BEFORE the earliest the boundary can arrive.
+
+        The SDK aims at ``(blocks_to_boundary + offset) * block_time`` seconds
+        from now. We want it to aim at ``blocks_to_boundary * floor - margin``,
+        where ``floor`` is the hard minimum block time (12.000s, measured over
+        30 days and never once below) — so the round is published no later
+        than the soonest the boundary can happen, whatever the chain does
+        afterwards. Solving for the value to pass:
+
+            block_time = (blocks_to_boundary * floor - margin) / (blocks + offset)
+
+        Recomputed per attempt because the runway shrinks between retries.
+        ``None`` when the schedule cannot be read or the arithmetic would go
+        non-positive, which leaves the SDK's own default rather than passing
+        it something absurd.
+        """
+        sched = await self._schedule()
+        if sched is None:
+            return None
+        current_block, tempo, last_epoch_block = sched
+        blocks_to_boundary = last_epoch_block + tempo - current_block
+        if blocks_to_boundary <= 0:
+            return None
+        cfg = self._weights_cfg()
+        aimed = blocks_to_boundary * cfg.block_time_floor_secs - cfg.reveal_margin_secs
+        if aimed <= 0:
+            return None
+        block_time = aimed / (blocks_to_boundary + _SDK_REVEAL_OFFSET_BLOCKS)
+        if block_time <= 0:
+            return None
+        logger.info(
+            f"Reveal target: aiming {cfg.reveal_margin_secs:.0f}s before the "
+            f"earliest boundary ({blocks_to_boundary} blocks out) — passing "
+            f"block_time={block_time:.6f}"
+        )
+        return block_time
 
     async def _find_latest_unprocessed_epoch(self):
         """
@@ -430,7 +580,9 @@ class WeightLoop:
         burn_weight: float,
     ) -> bool:
         """direct submission (no retry, used for burn-only)"""
-        return await self.submitter.submit(miner_weights, burn_weight)
+        return await self.submitter.submit(
+            miner_weights, burn_weight, block_time=await self._reveal_block_time()
+        )
 
     async def _save_audit_and_mark(
         self,
@@ -543,7 +695,11 @@ class WeightLoop:
         max_retries: int = 3,
     ) -> bool:
         for attempt in range(max_retries):
-            success = await self.submitter.submit(miner_weights, burn_weight)
+            # Recomputed per attempt: the runway shrinks between retries, and
+            # the round we target has to move with it.
+            success = await self.submitter.submit(
+                miner_weights, burn_weight, block_time=await self._reveal_block_time()
+            )
             if success:
                 return True
 
