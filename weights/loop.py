@@ -25,6 +25,91 @@ logger = logging.getLogger(__name__)
 
 _CU_RETRY_TIMEOUT = 1800  # 30 min
 
+# The SDK adds this many blocks to its predicted boundary before choosing a
+# drand round (`SECURITY_BLOCK_OFFSET` in bittensor's weight extrinsic). It is
+# unconditional, so the round it picks is always this far PAST the boundary
+# unless the caller compensates. Measured on mainnet as +2.8 blocks at every
+# commit position, and 3 is the value in the SDK today.
+#
+# THIS IS A FALLBACK, NOT THE SOURCE OF TRUTH. The margin degrades ~12s per
+# unit of offset error: at 4 it drops to +3s, at 5 it is -9s and the fix is
+# gone — silently, with no error and no log line, on a dependency bump we
+# did not audit. `measure_reveal_offset_blocks` derives the real value from
+# the installed library instead, and this constant is only used when that
+# cannot be done.
+_SDK_REVEAL_OFFSET_BLOCKS = 3
+
+
+def measure_reveal_offset_blocks() -> int:
+    """The offset the INSTALLED drand library actually applies.
+
+    Derived rather than trusted. The round it returns is
+    ``round_at(now + (blocks_remaining + offset) * block_time)``, so calling
+    it twice with the same schedule and two different ``block_time`` values
+    cancels everything except the offset:
+
+        (r1 - r2) * seconds_per_round = (remaining + offset) * (bt1 - bt2)
+
+    Purely local — no network, no chain, no extrinsic — so it is cheap enough
+    to do once per process. Any failure, or a result outside a sane range,
+    falls back to the compiled-in constant rather than shipping a margin
+    computed from nonsense.
+    """
+    seconds_per_round = 3.0
+    # The probe schedule must be SELF-CONSISTENT: the library reads both
+    # `blocks_since_last_step` and `current_block - last_epoch_block`, and
+    # feeding it two different answers to the same question produced a
+    # derived offset of 1004 blocks on the first attempt here.
+    tempo = 7200
+    blocks_since = 7000
+    last_epoch_block = 9_000_000
+    remaining = tempo - blocks_since
+    bt1, bt2 = 12.0, 6.0
+    try:
+        from bittensor_drand import get_encrypted_commit_v2
+
+        rounds = []
+        for bt in (bt1, bt2):
+            _commit, target = get_encrypted_commit_v2(
+                uids=[0],
+                weights=[1],
+                version_key=0,
+                last_epoch_block=last_epoch_block,
+                pending_epoch_at=0,
+                subnet_epoch_index=1,
+                tempo=tempo,
+                blocks_since_last_step=blocks_since,
+                current_block=last_epoch_block + blocks_since,
+                subnet_reveal_period_epochs=1,
+                block_time=bt,
+                hotkey=bytes(32),
+            )
+            rounds.append(int(target))
+        offset = round(
+            (rounds[0] - rounds[1]) * seconds_per_round / (bt1 - bt2) - remaining
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not measure the SDK reveal offset ({e}); falling back to "
+            f"{_SDK_REVEAL_OFFSET_BLOCKS} blocks"
+        )
+        return _SDK_REVEAL_OFFSET_BLOCKS
+    if not 0 <= offset <= 20:
+        logger.warning(
+            f"Measured an implausible SDK reveal offset ({offset} blocks); "
+            f"falling back to {_SDK_REVEAL_OFFSET_BLOCKS}"
+        )
+        return _SDK_REVEAL_OFFSET_BLOCKS
+    if offset != _SDK_REVEAL_OFFSET_BLOCKS:
+        logger.warning(
+            f"The installed drand library offsets its reveal target by "
+            f"{offset} blocks, not the {_SDK_REVEAL_OFFSET_BLOCKS} this code "
+            "was written against — using the measured value"
+        )
+    else:
+        logger.info(f"SDK reveal offset measured at {offset} blocks")
+    return offset
+
 
 class WeightLoop:
     def __init__(
@@ -51,6 +136,7 @@ class WeightLoop:
         self._last_update_block: int | None = None
         self._session_commits: dict[str, dict] = {}
         self._commits_initialized = False
+        self._reveal_offset_blocks: int | None = None
 
     async def run(self):
         self.running = True
@@ -156,20 +242,8 @@ class WeightLoop:
                                 f"expires in {blocks_until_expiry} blocks"
                             )
 
-        # tempo guard: don't submit more than once per tempo window
-        if self._last_submitted_block is not None:
-            current_block = await self.chain.get_current_block()
-            tempo = await self.chain.get_tempo()
-            if tempo > 0:
-                last_window = self._last_submitted_block // tempo
-                current_window = current_block // tempo
-                if last_window == current_window:
-                    blocks_left = tempo - (current_block % tempo)
-                    logger.info(
-                        f"Already submitted this tempo window, "
-                        f"{blocks_left} blocks until next window (tempo={tempo})"
-                    )
-                    return
+        if not await self._ready_to_commit():
+            return
 
         latest = await self._find_latest_unprocessed_epoch()
         if latest is None:
@@ -180,6 +254,204 @@ class WeightLoop:
 
         epoch_id, miner_configs, manifest, price_snapshot = latest
         await self._process_epoch(epoch_id, miner_configs, manifest, price_snapshot)
+
+    async def _schedule(self) -> "tuple[int, int, int] | None":
+        """``(current_block, tempo, last_epoch_block)`` from the chain's own
+        epoch clock, or ``None`` if that clock could not be read.
+
+        The anchor is returned raw rather than as a gap: callers need both
+        "when did this epoch begin" (to dedupe a commit) and "how long until
+        it ends" (to time one), and deriving either from the other is how a
+        sign error hides.
+        """
+        try:
+            current_block = await self.chain.get_current_block()
+            tempo = await self.chain.get_tempo()
+            getter = getattr(self.chain, "get_last_epoch_block", None)
+            if getter is None:
+                logger.debug("Chain interface exposes no epoch anchor")
+                return None
+            last_epoch_block = await getter()
+        except Exception as e:
+            # Any failure to read the clock is "no clock", never a boundary:
+            # the caller falls back to a conservative rolling cadence. This
+            # also keeps a chain implementation that predates these reads
+            # from taking the whole weight loop down.
+            logger.warning(f"Could not read the epoch schedule: {e}")
+            return None
+        if tempo is None or tempo <= 0 or last_epoch_block is None:
+            return None
+        return current_block, tempo, last_epoch_block
+
+    async def _ready_to_commit(self) -> bool:
+        """One commit per CHAIN epoch, inside the commit window.
+
+        Three separate jobs, all previously done by `block // tempo`:
+
+        1. **Don't commit twice for the same epoch.** Keyed off the chain's
+           boundary, so it means what it says. The old lattice was anchored
+           at block 0 and had drifted 3,329 blocks (~11h) from the real
+           boundary, which meant a validator's commit time was decided by
+           where its lattice line fell rather than by the epoch — and once
+           out of phase it stayed out, because the guard just repeated the
+           same 7200-block cadence forever.
+
+        2. **Hold until the boundary is close.** Freshness costs nothing:
+           every commit inside an epoch is keyed to that epoch and drains at
+           the same boundary, so committing later applies the same data at the
+           same time. What it buys is a shorter horizon, and the horizon is
+           what decides how long the ciphertext sits publicly decryptable
+           before the epoch closes (that window is the accumulated block-time
+           drift over the horizon). 200 blocks keeps it to ~20-30s while
+           still leaving 40 minutes of retries.
+
+        3. **Refuse when the runway is too short to land.** With less than a
+           few blocks of horizon the reveal round cannot clear the SDK's
+           offset, so the commit is arithmetically certain to miss its
+           boundary. Skipping costs nothing that sending would have gained:
+           the previous vector stays in storage either way, and the next
+           window is one epoch later in both cases.
+
+        With the chain clock unreadable, falls back to a ROLLING one-per-tempo
+        rule. That is the old cadence without the phase lock, and it is the
+        conservative direction: it can delay a commit, never duplicate one.
+        """
+        sched = await self._schedule()
+        if sched is None:
+            if self._last_submitted_block is None:
+                return True
+            try:
+                current_block = await self.chain.get_current_block()
+                tempo = await self.chain.get_tempo()
+            except Exception as e:
+                logger.warning(f"Could not read the chain clock: {e}")
+                return True
+            if tempo and tempo > 0 and current_block - self._last_submitted_block < tempo:
+                logger.info(
+                    "Epoch anchor unreadable; holding off — last submit was "
+                    f"{current_block - self._last_submitted_block} blocks ago "
+                    f"(tempo={tempo})"
+                )
+                return False
+            return True
+
+        current_block, tempo, last_epoch_block = sched
+        blocks_to_boundary = last_epoch_block + tempo - current_block
+
+        if (
+            self._last_submitted_block is not None
+            and self._last_submitted_block >= last_epoch_block
+        ):
+            logger.info(
+                "Already committed this epoch (submitted at block "
+                f"{self._last_submitted_block}, epoch began {last_epoch_block}); "
+                f"next boundary in {blocks_to_boundary} blocks"
+            )
+            return False
+
+        window = self._weights_cfg().commit_window_blocks
+        if window > 0 and blocks_to_boundary > window:
+            logger.info(
+                f"Holding the commit: {blocks_to_boundary} blocks to the "
+                f"boundary, committing inside the last {window}"
+            )
+            return False
+
+        floor = self._weights_cfg().commit_min_runway_blocks
+        if blocks_to_boundary < floor:
+            # SEND IT ANYWAY. An earlier version of this returned False here,
+            # reasoning that a commit which cannot be decrypted in time is
+            # wasted and the previous vector stays in `Weights` regardless.
+            # That reasoning is wrong and the cost is a full epoch of income.
+            #
+            # `LastUpdate` is written at COMMIT time and, on a commit-reveal
+            # subnet, the commit is its only writer — the reveal never touches
+            # it. The epoch marks a validator inactive when
+            # `last_update + activity_cutoff < current_block`, where the
+            # cutoff is `ActivityCutoffFactorMilli * tempo / 1000` — one whole
+            # tempo on netuid 19. Committing once per epoch puts consecutive
+            # commits exactly one tempo apart, which is inside the cutoff with
+            # room to spare; SKIP one and the gap doubles, the validator is
+            # masked out of `active_stake` (run_epoch.rs), and its dividends
+            # for that epoch are zero. Confirmed on chain: the one validator
+            # with `active=false` also has dividends of exactly 0.
+            #
+            # So the two outcomes are not comparable. A commit that misses its
+            # reveal costs one stale epoch. A commit never sent costs the
+            # epoch's entire income.
+            logger.warning(
+                f"Only {blocks_to_boundary} blocks to the boundary (wanted "
+                f"{floor}) — committing anyway: the reveal will probably land "
+                "one epoch late, but skipping would let LastUpdate age past "
+                "the activity cutoff and zero this validator's dividends"
+            )
+        return True
+
+    def _weights_cfg(self):
+        return self.config.weights
+
+    async def _commit_block(self) -> int:
+        """The block our commit was INCLUDED at, not the block we finished
+        confirming it at.
+
+        These differ, and the difference costs an epoch of income. `submit`
+        polls storage for up to a minute to prove the commit landed, so a
+        commit included at B-1 can be confirmed at B+1 — the far side of a
+        boundary. Recording the confirmation block then tells the per-epoch
+        guard "already committed this epoch" for the whole of the NEW epoch,
+        no commit goes out, and at the following boundary the real
+        `LastUpdate` is over the activity cutoff and dividends are zero. That
+        is the same failure the never-skip rule exists to prevent, arriving
+        through a different door — found by codex against this diff.
+
+        Falls back to the current block only when the submitter has no
+        verified block to offer.
+        """
+        block = getattr(self.submitter, "last_commit_block", None)
+        if isinstance(block, int):
+            return block
+        return await self.chain.get_current_block()
+
+    async def _reveal_block_time(self) -> float | None:
+        """The ``block_time`` to hand the SDK so its reveal round lands just
+        BEFORE the earliest the boundary can arrive.
+
+        The SDK aims at ``(blocks_to_boundary + offset) * block_time`` seconds
+        from now. We want it to aim at ``blocks_to_boundary * floor - margin``,
+        where ``floor`` is the hard minimum block time (12.000s, measured over
+        30 days and never once below) — so the round is published no later
+        than the soonest the boundary can happen, whatever the chain does
+        afterwards. Solving for the value to pass:
+
+            block_time = (blocks_to_boundary * floor - margin) / (blocks + offset)
+
+        Recomputed per attempt because the runway shrinks between retries.
+        ``None`` when the schedule cannot be read or the arithmetic would go
+        non-positive, which leaves the SDK's own default rather than passing
+        it something absurd.
+        """
+        sched = await self._schedule()
+        if sched is None:
+            return None
+        current_block, tempo, last_epoch_block = sched
+        blocks_to_boundary = last_epoch_block + tempo - current_block
+        if blocks_to_boundary <= 0:
+            return None
+        cfg = self._weights_cfg()
+        aimed = blocks_to_boundary * cfg.block_time_floor_secs - cfg.reveal_margin_secs
+        if aimed <= 0:
+            return None
+        if self._reveal_offset_blocks is None:
+            self._reveal_offset_blocks = measure_reveal_offset_blocks()
+        block_time = aimed / (blocks_to_boundary + self._reveal_offset_blocks)
+        if block_time <= 0:
+            return None
+        logger.info(
+            f"Reveal target: aiming {cfg.reveal_margin_secs:.0f}s before the "
+            f"earliest boundary ({blocks_to_boundary} blocks out) — passing "
+            f"block_time={block_time:.6f}"
+        )
+        return block_time
 
     async def _find_latest_unprocessed_epoch(self):
         """
@@ -271,7 +543,7 @@ class WeightLoop:
                     f"leaving epoch unprocessed for retry"
                 )
                 return False
-            self._last_submitted_block = await self.chain.get_current_block()
+            self._last_submitted_block = await self._commit_block()
             await self.store.mark_epoch_processed(epoch_id, weights_submitted=True)
             return True
 
@@ -311,7 +583,7 @@ class WeightLoop:
                 )
                 return False
             self._cu_retry_start.pop(epoch_id, None)
-            self._last_submitted_block = await self.chain.get_current_block()
+            self._last_submitted_block = await self._commit_block()
             await self.store.mark_epoch_processed(epoch_id, weights_submitted=True)
             return True
 
@@ -430,7 +702,9 @@ class WeightLoop:
         burn_weight: float,
     ) -> bool:
         """direct submission (no retry, used for burn-only)"""
-        return await self.submitter.submit(miner_weights, burn_weight)
+        return await self.submitter.submit(
+            miner_weights, burn_weight, block_time=await self._reveal_block_time()
+        )
 
     async def _save_audit_and_mark(
         self,
@@ -454,7 +728,7 @@ class WeightLoop:
             )
             return
 
-        block = await self.chain.get_current_block()
+        block = await self._commit_block()
         self._last_submitted_block = block
 
         miners_paid = sum(1 for m in weights_result.miners if m.weight > 0)
@@ -543,7 +817,11 @@ class WeightLoop:
         max_retries: int = 3,
     ) -> bool:
         for attempt in range(max_retries):
-            success = await self.submitter.submit(miner_weights, burn_weight)
+            # Recomputed per attempt: the runway shrinks between retries, and
+            # the round we target has to move with it.
+            success = await self.submitter.submit(
+                miner_weights, burn_weight, block_time=await self._reveal_block_time()
+            )
             if success:
                 return True
 

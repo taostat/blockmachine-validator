@@ -47,6 +47,63 @@ class WeightConfig:
     fallback_alpha_price_usd: Optional[float] = None
     fallback_emissions_alpha: Optional[float] = None
 
+    # --- reveal timing -----------------------------------------------------
+    #
+    # These four decide whether the weights this validator commits are
+    # decrypted in time to score the epoch they were computed for. They are
+    # overlaid from the registry's `weights` block, so the margin can be
+    # retuned across the network without another validator release.
+    #
+    # WHY THEY EXIST. The SDK picks the drand round it targets by predicting
+    # when the next epoch boundary will occur, assuming every block takes
+    # exactly `block_time` seconds, and then adding a 3-block safety offset
+    # that pushes the target PAST the boundary. Measured on mainnet: the
+    # target lands 2.8 blocks (~36s, ~12 drand rounds) after the boundary at
+    # every commit position. Real blocks average slightly over 12s, so the
+    # boundary drifts later than predicted and that drift is the only thing
+    # that ever rescues the commit — which is why, at epochs where the chain
+    # ran at exactly nominal speed, the whole validator set missed and scored
+    # the previous epoch's weights.
+    #
+    # A missed reveal is not lost: the pallet retries it every block and it
+    # lands at the FOLLOWING boundary. The damage is that the cohort splits —
+    # validators whose pulse arrived in time disagree with those whose did
+    # not, and validator_trust punishes the disagreement.
+    #
+    # `commit_window_blocks`: commit only when the boundary is this close.
+    #   Freshness is unaffected — a commit made anywhere inside the epoch is
+    #   keyed to the same epoch and drains at the same boundary — but a short
+    #   horizon shrinks the window in which the ciphertext is decryptable
+    #   before the epoch closes, because that window is the accumulated
+    #   block-time drift over the horizon.
+    # `commit_min_runway_blocks`: refuse to commit with less runway than this.
+    #   A commit sent with no runway cannot clear the offset and is
+    #   arithmetically certain to miss its boundary.
+    # `reveal_margin_secs`: aim this far before the EARLIEST possible
+    #   boundary. This is the whole safety margin; it is also roughly the
+    #   minimum time the ciphertext is decryptable early.
+    #
+    #   45s, NOT 15s, and the reason is two effects the block count hides.
+    #   The library adds its predicted duration to WALL-CLOCK NOW, but the
+    #   prediction is in whole blocks, so being partway through the current
+    #   block silently eats up to one block (12s) of the margin. And a pulse
+    #   has to be in `Drand::LastStoredRound` before the reveal runs, which
+    #   wants it published at least a block ahead rather than merely before
+    #   the boundary block. 15s covered neither and could land inside a
+    #   single drand round of the boundary; 45s leaves at least 2.7 blocks
+    #   of lead in the worst intra-block case. Raised after codex reproduced
+    #   the shortfall against this diff.
+    # `block_time_floor_secs`: the hard lower bound on mainnet block time.
+    #   Measured over 30 days / 88 rolling 7200-block windows: minimum
+    #   12.000000 s/block, integer-exact, never below. Aiming at the floor
+    #   is therefore aiming no later than the earliest the boundary can
+    #   possibly arrive. Raising this above the true floor breaks the
+    #   guarantee; lowering it only costs exposure.
+    commit_window_blocks: int = 200
+    commit_min_runway_blocks: int = 20
+    reveal_margin_secs: float = 45.0
+    block_time_floor_secs: float = 12.0
+
 
 @dataclass
 class VerificationConfig:

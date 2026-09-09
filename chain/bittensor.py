@@ -86,7 +86,29 @@ class BittensorChain:
                 self._consecutive_failures += 1
                 raise
 
-    async def set_weights(self, uids: list[int], weights: list[int]) -> bool:
+    async def set_weights(
+        self,
+        uids: list[int],
+        weights: list[int],
+        block_time: float | None = None,
+    ) -> bool:
+        """Commit weights. ``block_time`` steers the drand round we target.
+
+        The SDK derives the reveal round by predicting the next boundary as
+        ``blocks_remaining * block_time`` and then adding a 3-block safety
+        offset. Its default of 12.0 therefore aims PAST the boundary and the
+        reveal misses the epoch it was computed for. The caller computes a
+        value that aims just before the earliest the boundary can arrive; see
+        ``WeightLoop._reveal_block_time``.
+
+        Passing it is conditional on the installed SDK accepting it: the
+        parameter arrived in bittensor 10.x, and binding an unknown keyword
+        would raise before any extrinsic is built — a hard failure on an
+        older SDK where the old behaviour would at least still commit.
+        """
+        kwargs: dict = {}
+        if block_time is not None and self._supports_block_time():
+            kwargs["block_time"] = block_time
         async with self._subtensor_lock:
             await self._maybe_reconnect()
             try:
@@ -98,12 +120,42 @@ class BittensorChain:
                     weights=weights,
                     wait_for_inclusion=True,
                     wait_for_finalization=True,
+                    **kwargs,
                 )
                 self._consecutive_failures = 0
             except Exception:
                 self._consecutive_failures += 1
                 raise
         return self._parse_chain_result(result, "set_weights")
+
+    def _supports_block_time(self) -> bool:
+        """Does the installed SDK's ``set_weights`` accept ``block_time``?
+
+        Cached, and any failure to introspect answers "no" — losing control
+        of the reveal round costs us the fix, while passing a keyword the
+        callee does not take costs us the commit entirely.
+        """
+        cached = getattr(self, "_block_time_supported", None)
+        if cached is not None:
+            return cached
+        supported = False
+        try:
+            import inspect
+
+            params = inspect.signature(self.subtensor.set_weights).parameters
+            supported = "block_time" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Could not introspect set_weights: {e}")
+        if not supported:
+            logger.warning(
+                "This bittensor SDK's set_weights takes no block_time — the "
+                "reveal round cannot be steered and commits will target ~36s "
+                "past the epoch boundary. Upgrade the SDK to fix reveal timing."
+            )
+        self._block_time_supported = supported
+        return supported
 
     async def get_miners(self) -> list[MinerInfo]:
         async with self._subtensor_lock:
@@ -179,6 +231,46 @@ class BittensorChain:
         except Exception as e:
             self._consecutive_failures += 1
             logger.debug(f"Could not query pending weight commits: {e}")
+            return None
+
+    async def get_last_epoch_block(self) -> int | None:
+        """``LastEpochBlock`` for this subnet: the block the last epoch ran at.
+
+        THIS IS THE ONLY HONEST EPOCH CLOCK, and the reason a second one is
+        not used: `block // tempo` is a lattice anchored at block 0, and the
+        chain's boundary is a stateful counter that has drifted off it — on
+        mainnet the two were 3,329 blocks (~11h) apart when this was written.
+        Anything that schedules against the lattice fires at an arbitrary
+        phase relative to the real epoch.
+
+        Deliberately NOT ``LastMechansimStepBlock`` (upstream's typo, and it
+        is a different quantity): that is written only when an epoch actually
+        distributed emissions, while ``LastEpochBlock`` advances whenever the
+        slot is consumed — including a skipped epoch. Commits are keyed by
+        the epoch counter that moves with ``LastEpochBlock``, so anchoring on
+        the other one would leave us not committing while the queue key had
+        already advanced, and the un-revealed commit would then be discarded.
+
+        ``None`` on any read failure: absence of an answer is not an answer,
+        and the caller falls back rather than treating it as a boundary.
+        """
+        try:
+            async with self._subtensor_lock:
+                await self._maybe_reconnect()
+                result = self.subtensor.substrate.query(
+                    "SubtensorModule", "LastEpochBlock", [self.netuid]
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
+            value = getattr(result, "value", None)
+            if value is None:
+                logger.warning("LastEpochBlock read returned no value")
+                return None
+            self._consecutive_failures = 0
+            return int(value)
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.warning(f"Could not read LastEpochBlock: {e}")
             return None
 
     async def get_blocks_since_last_update(self) -> int | None:

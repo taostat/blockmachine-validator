@@ -18,6 +18,12 @@ _VERIFY_DELAY_SECS = 12.0
 class WeightSubmitter:
     def __init__(self, chain: ChainInterface, weights_config: WeightConfig):
         self.chain = chain
+        # The block the last verified commit was INCLUDED at, straight from
+        # the storage read that proved it. Not the block we finished
+        # verifying at: verification polls for up to a minute, so those two
+        # can sit on opposite sides of an epoch boundary, and the caller
+        # dedupes commits per epoch off this value.
+        self.last_commit_block: int | None = None
         # Held by reference so registry-driven hot-reloads of burn_sink_uid
         # take effect on the next submit() without a process restart.
         self._weights = weights_config
@@ -26,8 +32,14 @@ class WeightSubmitter:
         self,
         miner_weights: list[tuple[int, float]],
         burn_weight: float,
+        block_time: float | None = None,
     ) -> bool:
-        """Normalize and submit weights to chain. Returns True on success."""
+        """Normalize and submit weights to chain. Returns True on success.
+
+        ``block_time`` steers which drand round the commit targets; the
+        caller recomputes it per attempt from the remaining runway. ``None``
+        leaves the SDK's default, which aims past the boundary.
+        """
         burn_sink_uid = self._weights.burn_sink_uid
         all_weights = list(miner_weights)
         if burn_weight > 0:
@@ -51,7 +63,11 @@ class WeightSubmitter:
             # Captured BEFORE the submit so the chain read below answers
             # "did THIS submit land", not "have we ever committed".
             since_block = await self.chain.get_current_block()
-            claimed = await self.chain.set_weights(uids, values)
+            # Passed only when we actually computed one: a ChainInterface
+            # that predates this keyword (or a test double) must keep
+            # working, and `None` carries no information the callee needs.
+            extra = {} if block_time is None else {"block_time": block_time}
+            claimed = await self.chain.set_weights(uids, values, **extra)
         except Exception as e:
             logger.error(f"Weight submission error: {e}")
             return False
@@ -75,7 +91,15 @@ class WeightSubmitter:
         # are capped at 10 unrevealed commits per hotkey per epoch with
         # identical-content vectors, of which the last-decrypted wins.
         attempts = _VERIFY_ATTEMPTS if claimed else 2
+        self.last_commit_block = None
         verified = await self._commit_landed_on_chain(since_block, attempts)
+        if verified and self.last_commit_block is None:
+            # Verified but the proof carried no block: fall back to the block
+            # sampled BEFORE the submit, which is never later than inclusion.
+            # Recording a later block is what suppresses the next epoch's
+            # commit; recording an earlier one only risks a duplicate that
+            # the chain's own rate limit rejects.
+            self.last_commit_block = since_block
         if verified:
             if not claimed:
                 logger.warning(
@@ -103,6 +127,10 @@ class WeightSubmitter:
                 could_not_read += 1
                 continue
             if proof.get("landed"):
+                commit_block = proof.get("commit_block")
+                self.last_commit_block = (
+                    int(commit_block) if commit_block is not None else None
+                )
                 logger.info(
                     f"Commit verified on chain: epoch={proof.get('epoch')} "
                     f"block={proof.get('commit_block')} "
@@ -128,8 +156,29 @@ class WeightSubmitter:
         return False
 
     async def blocks_until_next_epoch(self) -> int:
+        """Blocks until the chain's next epoch boundary.
+
+        Anchored on ``LastEpochBlock``, not on ``block % tempo``: the lattice
+        is anchored at block 0 and the chain's boundary is a stateful counter
+        that has drifted off it, so the old arithmetic could report 200
+        blocks left with 3,500 to go, or the reverse. Callers use this to
+        decide whether there is time to retry, so being wrong here abandons
+        submissions that had hours in hand.
+
+        Falls back to the lattice only when the anchor cannot be read, and
+        clamps at 0 so a caller never sees a negative runway.
+        """
         block = await self.chain.get_current_block()
         tempo = await self.chain.get_tempo()
-        if tempo == 0:
+        if tempo <= 0:
             return 0
-        return tempo - (block % tempo)
+        last_epoch_block = None
+        getter = getattr(self.chain, "get_last_epoch_block", None)
+        if getter is not None:
+            try:
+                last_epoch_block = await getter()
+            except Exception as e:
+                logger.warning(f"Could not read the epoch anchor: {e}")
+        if last_epoch_block is None:
+            return tempo - (block % tempo)
+        return max(0, last_epoch_block + tempo - block)
