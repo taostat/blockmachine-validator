@@ -20,7 +20,47 @@ class S3Repository:
         self._bucket_name: Optional[str] = None
         self._endpoint_url: Optional[str] = None
         self._s3_prefix = ""
-        self._parse_bucket_url()
+        # The config values the current client was built from. `s3_config`
+        # is the SAME object the registry refresh mutates in place, so
+        # comparing against this on every use is what lets a refreshed
+        # endpoint reach the client — previously the endpoint was parsed
+        # once here and never looked at again, which left a validator whose
+        # startup fetch had failed on an empty endpoint for the life of the
+        # process, even after the hourly refresh had brought the real one.
+        self._built_from: Optional[tuple] = None
+        self._parsed_from: Optional[tuple] = None
+        self._reparse_if_changed()
+
+    def _reparse_if_changed(self) -> tuple:
+        """Re-derive endpoint/bucket whenever the config has moved.
+
+        Keyed on the config VALUES, not on whether a client exists: the
+        first version of this rebuild only re-parsed when dropping a built
+        client, so a validator that had never managed to build one (empty
+        endpoint at startup) kept its stale parse even after the refresh
+        landed — the exact case it was written for. Caught by the test.
+        """
+        fingerprint = self._config_fingerprint()
+        if fingerprint != self._parsed_from:
+            if self._parsed_from is not None:
+                logger.info("S3 config changed since the client was built; rebuilding")
+                self._s3_client = None
+            self._parse_bucket_url()
+            self._parsed_from = fingerprint
+        return fingerprint
+
+    def _config_fingerprint(self) -> tuple:
+        c = self.s3_config
+        return (
+            c.bucket_url,
+            c.bucket_name,
+            c.endpoint_url,
+            getattr(c, "prefix", "") or "",
+            c.region,
+            getattr(c, "addressing_style", "auto"),
+            c.access_key_id,
+            c.secret_access_key,
+        )
 
     def _parse_bucket_url(self):
         if self.s3_config.bucket_name:
@@ -62,7 +102,18 @@ class S3Repository:
         )
 
     def _get_s3(self):
+        fingerprint = self._reparse_if_changed()
+        if not self._endpoint_url:
+            # Refuse to build a client that cannot work. boto3 accepts an
+            # empty endpoint and fails later, per call, with the unhelpful
+            # `Invalid endpoint: ` — which is exactly the line uid 241's
+            # operator was reading while the timeout rule burned their epoch.
+            raise RuntimeError(
+                "S3 endpoint is not configured — the registry config has not "
+                "been applied (bucket_name/endpoint_url or bucket_url are empty)"
+            )
         if self._s3_client is None:
+            self._built_from = fingerprint
             has_creds = (
                 self.s3_config.access_key_id and self.s3_config.secret_access_key
             )
@@ -93,9 +144,14 @@ class S3Repository:
 
     @property
     def prefix(self) -> str:
+        # Re-derived on read: callers build keys BEFORE the first request
+        # triggers a rebuild, so without this the first request after a
+        # refresh pairs the old prefix with the new bucket. Raised by codex.
+        self._reparse_if_changed()
         return self._s3_prefix
 
     def key(self, *parts: str) -> str:
+        self._reparse_if_changed()
         k = "/".join(parts)
         return f"{self._s3_prefix}/{k}" if self._s3_prefix else k
 

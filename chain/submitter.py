@@ -111,6 +111,36 @@ class WeightSubmitter:
             logger.error("Weight submission rejected — will retry")
         return verified
 
+    async def resubmit_previous(
+        self,
+        vector: list[tuple[int, int]],
+        block_time: float | None = None,
+    ) -> bool:
+        """Commit a vector that is already on chain, unchanged.
+
+        The values are the chain's own u16 weights, so they are already
+        max-normalized; passing them through `submit` with no burn entry
+        reproduces them exactly (normalization scales against the largest,
+        which is 65535 already). Going through `submit` rather than around it
+        keeps the one verification path: a re-send that the chain rejected
+        must read as not submitted, like any other.
+        """
+        vector = [(uid, w) for uid, w in vector if w > 0]
+        if not vector:
+            # `submit` fails closed to a full burn on an empty set, which is
+            # exactly what a re-send must never do. Refuse here as well as in
+            # the loop: two callers, one rule.
+            logger.error("resubmit_previous called with no positive weights — refusing")
+            return False
+        logger.warning(
+            f"Re-sending the {len(vector)}-entry weight vector already on chain "
+            "(the epoch's traffic data could not be read; this keeps LastUpdate "
+            "fresh without inventing weights)"
+        )
+        return await self.submit(
+            [(int(uid), float(w)) for uid, w in vector], 0.0, block_time=block_time
+        )
+
     async def _commit_landed_on_chain(self, since_block: int, attempts: int) -> bool:
         could_not_read = 0
         for attempt in range(attempts):

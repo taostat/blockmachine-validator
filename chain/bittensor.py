@@ -273,6 +273,46 @@ class BittensorChain:
             logger.warning(f"Could not read LastEpochBlock: {e}")
             return None
 
+    async def get_own_weights(self) -> "list[tuple[int, int]] | None":
+        """This validator's weight vector as the chain holds it right now.
+
+        Read from `Weights[netuid, uid]` storage, not from a lite metagraph
+        (which carries no weights). Used to RE-SEND the last good vector when
+        the epoch's traffic data cannot be read: the alternative that shipped
+        for months was to give every unit of weight to the burn address,
+        which zeroes the validator's trust and dividends for the epoch.
+
+        Three outcomes and the caller must keep them apart: a vector; an
+        empty list (this hotkey has never set weights — nothing to re-send);
+        ``None`` (the chain could not be read — say nothing, do nothing).
+        """
+        try:
+            async with self._subtensor_lock:
+                await self._maybe_reconnect()
+                uid = self.subtensor.substrate.query(
+                    "SubtensorModule", "Uids", [self.netuid, self.hotkey.ss58_address]
+                )
+                if asyncio.iscoroutine(uid):
+                    uid = await uid
+                uid_value = getattr(uid, "value", uid)
+                if uid_value is None:
+                    logger.warning("Own uid not found on chain; cannot read weights")
+                    return None
+                result = self.subtensor.substrate.query(
+                    "SubtensorModule", "Weights", [self.netuid, int(uid_value)]
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
+            value = getattr(result, "value", result)
+            self._consecutive_failures = 0
+            if not value:
+                return []
+            return [(int(dest), int(weight)) for dest, weight in value]
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.warning(f"Could not read own weights from chain: {e}")
+            return None
+
     async def get_blocks_since_last_update(self) -> int | None:
         try:
             async with self._subtensor_lock:
