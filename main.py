@@ -71,42 +71,75 @@ async def _create_reference_manager(
 
 # Backoff for the startup config fetch: quick first retries, then a minute.
 _CONFIG_FETCH_BACKOFF_SECS = (5, 10, 20, 40, 60)
+# How long startup waits for the registry before starting the loops anyway.
+# Long enough to ride out a deploy or a blip; short enough that a validator
+# restarting during a registry outage is back on chain well inside the
+# activity cutoff (one tempo, 24h) — see the docstring for why that matters.
+_CONFIG_FETCH_STARTUP_BUDGET_SECS = 600
+# Normal refresh cadence once configured.
+_CONFIG_REFRESH_SEC = 3600
+# Until the first successful fetch, the refresh loop retries this often
+# instead of hourly.
+_CONFIG_REFRESH_UNTIL_FETCHED_SEC = 60
 
 
-async def fetch_registry_config_or_wait(client, config, *, sleep=asyncio.sleep) -> None:
-    """Fetch the registry config at startup, retrying until it succeeds.
+async def fetch_registry_config_or_wait(
+    client, config, *, sleep=asyncio.sleep, budget_secs=_CONFIG_FETCH_STARTUP_BUDGET_SECS
+) -> bool:
+    """Fetch the registry config at startup, retrying for up to `budget_secs`.
 
-    THIS NEVER FALLS THROUGH. The previous version caught the failure, logged
-    a warning that said "using local defaults", and carried on. The local
-    default for the log bucket's endpoint is nothing — so the S3 client was
-    built with an empty endpoint, every fetch of the epoch's traffic data
-    failed with `Invalid endpoint: `, and thirty minutes later the weight
-    loop's timeout rule gave the validator's entire weight to the burn
-    address. A validator holding 9% of stake lost an epoch of dividends to a
-    single failed request at startup (uid 241, 2026-09-10); another sat in
-    the same state for a month.
+    Returns True once applied, False if the budget ran out. THE VALIDATOR
+    NEVER PROCEEDS AS IF IT HAD CONFIG WHEN IT DOES NOT — but it does
+    proceed.
 
-    A validator with no config cannot do anything useful, and doing
-    something anyway is what cost the money. So it waits, loudly, until the
-    registry answers. Operators see one ERROR line per attempt; a process
-    that has not started its loops is a process nobody mistakes for healthy.
+    Why not wait forever. The previous version of this fix blocked startup
+    until the registry answered. Codex pointed out what that costs: a
+    validator restarting during a registry outage would sit outside the
+    chain for the whole outage, cross `LastUpdate + activity_cutoff`, and
+    lose the epoch's dividends — the exact harm the whole release exists to
+    prevent, arriving from the other direction.
+
+    Why proceeding is now safe. Two other changes in this release make a
+    config-less loop harmless: the S3 client refuses an empty endpoint with
+    a clear error instead of limping, so the epoch's data reads as
+    unavailable; and the data-unavailable timeout RE-SENDS the vector
+    already on chain instead of burning. So a validator with no config
+    keeps its previous vote alive and stays inside the cutoff, and the
+    refresh loop (retrying every minute until the first success) brings the
+    real config in when the registry returns — which the S3 client now
+    picks up without a restart.
+
+    Why not fall through immediately, as before. A failed first request is
+    usually a blip; ten minutes of retries turns almost every one of those
+    into a normal start, and a config-less start is loud (one ERROR per
+    attempt) rather than a warning that says "using local defaults".
     """
     attempt = 0
+    waited = 0.0
     while True:
         try:
             remote_cfg = await client.fetch()
             apply_registry_config(config, remote_cfg)
             logger.info("Fetched validator config from registry")
-            return
+            return True
         except Exception as e:
             delay = _CONFIG_FETCH_BACKOFF_SECS[min(attempt, len(_CONFIG_FETCH_BACKOFF_SECS) - 1)]
             attempt += 1
+            if waited + delay > budget_secs:
+                logger.error(
+                    f"Could not fetch validator config from registry after "
+                    f"{attempt} attempts over {waited:.0f}s: {e} — starting "
+                    "WITHOUT it. Weights cannot be computed until it arrives; "
+                    "the previous on-chain vector will be re-sent to stay "
+                    "active, and the refresh loop retries every minute."
+                )
+                return False
             logger.error(
                 f"Could not fetch validator config from registry (attempt "
-                f"{attempt}): {e} — NOT starting with local defaults; retrying "
-                f"in {delay}s"
+                f"{attempt}): {e} — retrying in {delay}s"
             )
             await sleep(delay)
+            waited += delay
 
 
 async def main():
@@ -153,7 +186,7 @@ async def main():
         registry_url=config.registry_url,
         token_provider=token_provider,
     )
-    await fetch_registry_config_or_wait(registry_config_client, config)
+    config_fetched = await fetch_registry_config_or_wait(registry_config_client, config)
 
     # prices — built after registry overlay so weights.price_* take effect
     price_netuid = config.weights.price_netuid or config.netuid
@@ -218,20 +251,31 @@ async def main():
 
     # periodic config refresh — keeps the registry's view of our version
     # current, and picks up any registry-side config tweaks. Hourly cadence
-    # is plenty since these values rarely change.
-    _CONFIG_REFRESH_SEC = 3600
+    # is plenty since these values rarely change (constant is module-level
+    # so its relation to the until-fetched cadence can be asserted).
 
     async def _config_refresh_loop():
+        fetched = config_fetched
         while True:
             try:
-                await asyncio.sleep(_CONFIG_REFRESH_SEC)
+                # Every minute until the first success, hourly after: a
+                # validator that started without config must not wait an
+                # hour to be told where the logs are.
+                await asyncio.sleep(
+                    _CONFIG_REFRESH_SEC if fetched else _CONFIG_REFRESH_UNTIL_FETCHED_SEC
+                )
                 remote_cfg = await registry_config_client.fetch()
                 apply_registry_config(config, remote_cfg)
+                if not fetched:
+                    logger.info("Registry config fetched; the validator is now fully configured")
+                fetched = True
                 logger.debug("Refreshed validator config from registry")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"Config refresh error (non-fatal): {e}")
+                (logger.error if not fetched else logger.warning)(
+                    f"Config refresh error ({'STILL UNCONFIGURED' if not fetched else 'non-fatal'}): {e}"
+                )
 
     config_refresh_task = asyncio.create_task(_config_refresh_loop())
 

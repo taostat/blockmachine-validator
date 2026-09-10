@@ -318,9 +318,14 @@ def test_the_startup_fetch_retries_until_the_registry_answers():
     )
 
 
-def test_the_startup_fetch_does_not_return_while_failing():
-    """It must never proceed with empty settings. Bounded here by making
-    sleep raise after a few rounds; in production it keeps going."""
+def test_the_startup_fetch_gives_up_after_its_budget_but_never_applies_defaults():
+    """CODEX P1 on the first version: waiting FOREVER for the registry would
+    hold a validator restarting during a registry outage off the chain until
+    it crossed the activity cutoff — the harm this release exists to prevent,
+    from the other direction. So the wait is bounded. But giving up must
+    mean "start without config", never "start with local defaults": the
+    S3 client refuses an empty endpoint and the timeout re-sends the previous
+    vector, so a config-less loop is safe; a defaults-filled one was not."""
     from validator.main import fetch_registry_config_or_wait
 
     class DeadClient:
@@ -330,18 +335,85 @@ def test_the_startup_fetch_does_not_return_while_failing():
             self.calls += 1
             raise ConnectionError("registry unreachable")
 
-    class Enough(Exception):
+    slept = []
+
+    class Unbounded(AssertionError):
         pass
 
-    rounds = []
-
     async def fake_sleep(secs):
-        rounds.append(secs)
-        if len(rounds) >= 7:
-            raise Enough()
+        slept.append(secs)
+        # A loop with no budget never returns; the first version of this
+        # test simply hung on that mutant instead of failing it.
+        if len(slept) > 40:
+            raise Unbounded("the startup fetch is not honouring its budget")
 
     config = ValidatorConfig()
-    with pytest.raises(Enough):
-        run(fetch_registry_config_or_wait(DeadClient(), config, sleep=fake_sleep))
-    assert config.s3.endpoint_url is None, "proceeded with local defaults"
-    assert rounds[-1] == 60, "backoff should cap at 60s"
+    client = DeadClient()
+    ok = run(fetch_registry_config_or_wait(client, config, sleep=fake_sleep, budget_secs=600))
+    assert ok is False
+    assert sum(slept) <= 600, f"waited {sum(slept)}s against a 600s budget"
+    assert sum(slept) >= 300, f"gave up too early: {sum(slept)}s"
+    assert slept[-1] == 60, "backoff should cap at 60s"
+    assert config.s3.endpoint_url is None and config.s3.bucket_name is None, (
+        "proceeded with local defaults — the endpoint must stay empty so the "
+        "S3 client refuses rather than limps"
+    )
+
+
+def test_the_refresh_loop_retries_fast_until_the_first_success():
+    """A validator that started without config must not wait an hour to be
+    told where the logs are."""
+    from validator import main as main_mod
+
+    assert main_mod._CONFIG_REFRESH_UNTIL_FETCHED_SEC <= 60
+    assert main_mod._CONFIG_REFRESH_UNTIL_FETCHED_SEC < main_mod._CONFIG_REFRESH_SEC
+
+
+# ---------------------------------------------------------------------------
+# codex findings on the first version of this release
+# ---------------------------------------------------------------------------
+
+
+def test_an_all_zero_on_chain_vector_is_not_resent_as_a_burn():
+    """CODEX P1. The chain zeroes a validator's weight on a replaced uid
+    without removing the entry, so `Weights` can be non-empty and all zeros.
+    `submit` normalizes an empty positive set to [(burn, 65535)] — the burn
+    this path exists to prevent, back through a side door."""
+    loop = _loop(own_weights=[(178, 0), (129, 0)])
+    done = run(loop._process_epoch("9024961", {"hk": {}}, manifest={"gw": {}}))
+    assert done is False
+    loop.submitter.resubmit_previous.assert_not_awaited()
+    loop.submitter.submit.assert_not_awaited()
+
+
+def test_zero_entries_are_dropped_and_positive_ones_resent():
+    loop = _loop(own_weights=[(178, 65535), (129, 0), (237, 21928)])
+    run(loop._process_epoch("9024961", {"hk": {}}, manifest={"gw": {}}))
+    sent = loop.submitter.resubmit_previous.await_args.args[0]
+    assert sent == [(178, 65535), (237, 21928)], sent
+
+
+def test_the_submitter_itself_refuses_an_all_zero_vector():
+    """Two callers, one rule: even a caller that skips the loop's filter
+    cannot turn a zero vector into a burn."""
+    chain = RecordingChain()
+    submitter = WeightSubmitter(chain, ValidatorConfig().weights)
+    assert run(submitter.resubmit_previous([(178, 0), (129, 0)])) is False
+    assert chain.calls == []
+
+
+def test_keys_built_before_the_first_request_use_the_refreshed_prefix():
+    """CODEX P2. `LogsClient` builds the object key BEFORE the request that
+    would trigger the client rebuild, so the first request after a refresh
+    paired the old prefix with the new bucket."""
+    cfg = S3Config(bucket_name="b", endpoint_url="https://s3.example", prefix="old")
+    repo, _ = _repo_with_fake_boto(cfg)
+    assert repo.key("epochs", "1", "x.json") == "old/epochs/1/x.json"
+    cfg.prefix = "new"
+    # `key()` FIRST: reading `prefix` first would re-parse on its behalf and
+    # hide a `key()` that never re-parses — which is exactly the mutant this
+    # test let through on its first version.
+    assert repo.key("epochs", "1", "x.json") == "new/epochs/1/x.json", (
+        "the key was built from the prefix the client was constructed with"
+    )
+    assert repo.prefix == "new"

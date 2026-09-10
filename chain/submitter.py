@@ -125,8 +125,12 @@ class WeightSubmitter:
         keeps the one verification path: a re-send that the chain rejected
         must read as not submitted, like any other.
         """
+        vector = [(uid, w) for uid, w in vector if w > 0]
         if not vector:
-            logger.error("resubmit_previous called with an empty vector")
+            # `submit` fails closed to a full burn on an empty set, which is
+            # exactly what a re-send must never do. Refuse here as well as in
+            # the loop: two callers, one rule.
+            logger.error("resubmit_previous called with no positive weights — refusing")
             return False
         logger.warning(
             f"Re-sending the {len(vector)}-entry weight vector already on chain "

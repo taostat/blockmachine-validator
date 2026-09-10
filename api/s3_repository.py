@@ -144,9 +144,14 @@ class S3Repository:
 
     @property
     def prefix(self) -> str:
+        # Re-derived on read: callers build keys BEFORE the first request
+        # triggers a rebuild, so without this the first request after a
+        # refresh pairs the old prefix with the new bucket. Raised by codex.
+        self._reparse_if_changed()
         return self._s3_prefix
 
     def key(self, *parts: str) -> str:
+        self._reparse_if_changed()
         k = "/".join(parts)
         return f"{self._s3_prefix}/{k}" if self._s3_prefix else k
 

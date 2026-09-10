@@ -735,9 +735,16 @@ class WeightLoop:
                 "weights — not committing this cycle"
             )
             return False
+        # Zero entries are dropped BEFORE deciding whether there is a vector.
+        # The chain zeroes a validator's weight on a uid whose neuron was
+        # replaced without removing the entry, so a stored vector can be
+        # non-empty and all zeros; passed straight to the submitter that
+        # normalizes to [(burn, 65535)] — the burn this path exists to
+        # prevent, back through a side door. Raised by codex.
+        previous = [(uid, w) for uid, w in previous if w > 0]
         if not previous:
             logger.error(
-                f"Epoch {epoch_id}: no traffic data and no previous weights on "
+                f"Epoch {epoch_id}: no traffic data and no positive weights on "
                 "chain — this validator has nothing honest to submit; waiting"
             )
             return False
