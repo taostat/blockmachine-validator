@@ -569,18 +569,26 @@ class WeightLoop:
                 )
                 return False
 
+            # NEVER BURN HERE. This branch used to submit 100% to the burn
+            # address, on the theory that no data means nothing to pay. What
+            # it actually meant, twice on mainnet, was: one failed read of
+            # the traffic logs, thirty minutes of retries, then the
+            # validator's whole weight to uid 108 — validator_trust 0,
+            # dividends 0, for a validator holding 9% of stake (uid 241,
+            # 2026-09-10; uid 65 had sat in the same state since August).
+            # The data being unreadable says nothing about the miners; it
+            # says the validator cannot see. A validator that cannot see
+            # should keep saying what it last said, which also keeps its
+            # LastUpdate inside the activity cutoff.
             logger.warning(
-                f"No CU allocations for {epoch_id} after {elapsed:.0f}s, submitting 100% burn"
+                f"No CU allocations for {epoch_id} after {elapsed:.0f}s — "
+                "re-sending the previous vector rather than burning"
             )
-            submitted = await self._submit_direct([], 1.0)
+            submitted = await self._resend_previous_weights(epoch_id)
             if not submitted:
                 # Timer deliberately NOT popped: elapsed already exceeds the
-                # timeout, so the retry next cycle goes straight to submit
-                # instead of waiting another 30 minutes.
-                logger.error(
-                    f"Epoch {epoch_id}: CU-timeout burn submission failed — "
-                    f"leaving epoch unprocessed for retry"
-                )
+                # timeout, so the retry next cycle goes straight to the
+                # re-send instead of waiting another 30 minutes.
                 return False
             self._cu_retry_start.pop(epoch_id, None)
             self._last_submitted_block = await self._commit_block()
@@ -695,6 +703,45 @@ class WeightLoop:
             submitted,
         )
         return submitted
+
+    async def _resend_previous_weights(self, epoch_id: str) -> bool:
+        """Re-commit whatever vector this validator already has on chain.
+
+        Three outcomes, kept apart on purpose:
+          * a vector on chain      -> re-send it (True/False from the submit)
+          * nothing on chain       -> a brand-new validator with no data; do
+                                      NOT commit — it has no income to protect
+                                      and nothing honest to say
+          * the chain unreadable   -> do nothing this cycle; the expired timer
+                                      means the next cycle tries again
+        None of them submits a burn.
+        """
+        getter = getattr(self.chain, "get_own_weights", None)
+        resend = getattr(self.submitter, "resubmit_previous", None)
+        if getter is None or resend is None:
+            logger.error(
+                f"Epoch {epoch_id}: no traffic data and this chain/submitter "
+                "cannot re-send the previous vector — not committing"
+            )
+            return False
+        try:
+            previous = await getter()
+        except Exception as e:
+            logger.error(f"Epoch {epoch_id}: could not read own weights ({e}); not committing")
+            return False
+        if previous is None:
+            logger.error(
+                f"Epoch {epoch_id}: chain unreadable, cannot re-send previous "
+                "weights — not committing this cycle"
+            )
+            return False
+        if not previous:
+            logger.error(
+                f"Epoch {epoch_id}: no traffic data and no previous weights on "
+                "chain — this validator has nothing honest to submit; waiting"
+            )
+            return False
+        return await resend(previous, block_time=await self._reveal_block_time())
 
     async def _submit_direct(
         self,

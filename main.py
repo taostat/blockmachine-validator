@@ -69,6 +69,46 @@ async def _create_reference_manager(
     return manager
 
 
+# Backoff for the startup config fetch: quick first retries, then a minute.
+_CONFIG_FETCH_BACKOFF_SECS = (5, 10, 20, 40, 60)
+
+
+async def fetch_registry_config_or_wait(client, config, *, sleep=asyncio.sleep) -> None:
+    """Fetch the registry config at startup, retrying until it succeeds.
+
+    THIS NEVER FALLS THROUGH. The previous version caught the failure, logged
+    a warning that said "using local defaults", and carried on. The local
+    default for the log bucket's endpoint is nothing — so the S3 client was
+    built with an empty endpoint, every fetch of the epoch's traffic data
+    failed with `Invalid endpoint: `, and thirty minutes later the weight
+    loop's timeout rule gave the validator's entire weight to the burn
+    address. A validator holding 9% of stake lost an epoch of dividends to a
+    single failed request at startup (uid 241, 2026-09-10); another sat in
+    the same state for a month.
+
+    A validator with no config cannot do anything useful, and doing
+    something anyway is what cost the money. So it waits, loudly, until the
+    registry answers. Operators see one ERROR line per attempt; a process
+    that has not started its loops is a process nobody mistakes for healthy.
+    """
+    attempt = 0
+    while True:
+        try:
+            remote_cfg = await client.fetch()
+            apply_registry_config(config, remote_cfg)
+            logger.info("Fetched validator config from registry")
+            return
+        except Exception as e:
+            delay = _CONFIG_FETCH_BACKOFF_SECS[min(attempt, len(_CONFIG_FETCH_BACKOFF_SECS) - 1)]
+            attempt += 1
+            logger.error(
+                f"Could not fetch validator config from registry (attempt "
+                f"{attempt}): {e} — NOT starting with local defaults; retrying "
+                f"in {delay}s"
+            )
+            await sleep(delay)
+
+
 async def main():
     config_path = os.getenv("CONFIG_PATH")
     config = load_config(config_path)
@@ -113,15 +153,7 @@ async def main():
         registry_url=config.registry_url,
         token_provider=token_provider,
     )
-    try:
-        remote_cfg = await registry_config_client.fetch()
-        apply_registry_config(config, remote_cfg)
-        logger.info("Fetched validator config from registry")
-    except Exception as e:
-        logger.warning(
-            f"Failed to fetch validator config from registry: {e} — "
-            "using local defaults"
-        )
+    await fetch_registry_config_or_wait(registry_config_client, config)
 
     # prices — built after registry overlay so weights.price_* take effect
     price_netuid = config.weights.price_netuid or config.netuid
