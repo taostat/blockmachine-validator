@@ -162,7 +162,11 @@ class WeightLoop:
                 logger.info(f"Blocks since last weight update: {blocks_ago}")
                 record_blocks_since_update(blocks_ago)
 
-        if hasattr(self.chain, "get_pending_weight_commits"):
+        # Commit tracking only means something on a commit-reveal subnet:
+        # with the flag off nothing is ever queued, so the read is noise.
+        if hasattr(self.chain, "get_pending_weight_commits") and (
+            await self._commit_reveal_on()
+        ):
             commits = await self.chain.get_pending_weight_commits()
             if commits is None:
                 logger.debug("Could not fetch pending weight commits")
@@ -315,6 +319,16 @@ class WeightLoop:
         With the chain clock unreadable, falls back to a ROLLING one-per-tempo
         rule. That is the old cadence without the phase lock, and it is the
         conservative direction: it can delay a commit, never duplicate one.
+
+        WITH COMMIT-REVEAL OFF only job 1 applies. A plain set_weights is in
+        `Weights` the block it is included and pays out at the next boundary
+        whenever it was sent, so there is nothing to hold for: no ciphertext
+        to keep private (job 2) and no reveal round to land (job 3). The
+        vector goes on chain as soon as the finalized epoch exists. The
+        once-per-chain-epoch rule stays, for the same two reasons as before:
+        `LastUpdate` must keep advancing inside the activity cutoff, and the
+        chain's `WeightsSetRateLimit` rejects a second set too soon after
+        the first.
         """
         sched = await self._schedule()
         if sched is None:
@@ -348,6 +362,13 @@ class WeightLoop:
                 f"next boundary in {blocks_to_boundary} blocks"
             )
             return False
+
+        if not await self._commit_reveal_on():
+            logger.info(
+                "Commit-reveal is off: setting weights now, "
+                f"{blocks_to_boundary} blocks before the boundary"
+            )
+            return True
 
         window = self._weights_cfg().commit_window_blocks
         if window > 0 and blocks_to_boundary > window:
@@ -390,6 +411,29 @@ class WeightLoop:
     def _weights_cfg(self):
         return self.config.weights
 
+    async def _commit_reveal_on(self) -> bool:
+        """Is the subnet on commit-reveal? Unreadable means YES.
+
+        Read from the chain on every use rather than cached: the flag is a
+        subnet hyperparameter the owner can flip at any block, and the cost
+        of a stale answer is a whole epoch — held for a window that no
+        longer exists, or proved against storage the path never writes.
+        The commit path is the default because it is the one every
+        deployed validator has run for months; the plain-set path is taken
+        only on a definite "off".
+        """
+        getter = getattr(self.chain, "commit_reveal_enabled", None)
+        if getter is None:
+            return True
+        try:
+            enabled = await getter()
+        except Exception as e:
+            logger.warning(f"Could not read the commit-reveal flag: {e}")
+            return True
+        if enabled is None:
+            return True
+        return bool(enabled)
+
     async def _commit_block(self) -> int:
         """The block our commit was INCLUDED at, not the block we finished
         confirming it at.
@@ -428,8 +472,11 @@ class WeightLoop:
         Recomputed per attempt because the runway shrinks between retries.
         ``None`` when the schedule cannot be read or the arithmetic would go
         non-positive, which leaves the SDK's own default rather than passing
-        it something absurd.
+        it something absurd — and ``None`` with commit-reveal off, where
+        there is no round to aim at and nothing to log.
         """
+        if not await self._commit_reveal_on():
+            return None
         sched = await self._schedule()
         if sched is None:
             return None

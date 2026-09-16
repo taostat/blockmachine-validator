@@ -86,13 +86,45 @@ class BittensorChain:
                 self._consecutive_failures += 1
                 raise
 
+    async def commit_reveal_enabled(self) -> bool | None:
+        """``CommitRevealWeightsEnabled`` for this subnet, read from the chain.
+
+        This decides which of two very different things ``set_weights``
+        does. On: the SDK encrypts the vector to a drand round and the chain
+        applies it when the round is published, so the vector reaches
+        ``Weights`` at the next epoch boundary at best. Off: the SDK sends a
+        plain ``set_weights`` and the vector is in ``Weights`` the block it
+        is included. The submitter has to prove the right one, so it reads
+        the flag rather than assuming it.
+
+        ``None`` when the chain could not be read. The caller treats that as
+        ON: the commit path is the one every deployed validator has run for
+        months, and a wrong "off" would skip the commit window and prove the
+        submission against storage the commit never writes.
+        """
+        async with self._subtensor_lock:
+            await self._maybe_reconnect()
+            try:
+                result = await asyncio.to_thread(
+                    self.subtensor.commit_reveal_enabled, self.netuid
+                )
+                self._consecutive_failures = 0
+            except Exception as e:
+                self._consecutive_failures += 1
+                logger.warning(f"Could not read CommitRevealWeightsEnabled: {e}")
+                return None
+        return bool(result)
+
     async def set_weights(
         self,
         uids: list[int],
         weights: list[int],
         block_time: float | None = None,
     ) -> bool:
-        """Commit weights. ``block_time`` steers the drand round we target.
+        """Submit weights. With commit-reveal on this is a timelocked commit
+        and ``block_time`` steers the drand round we target; with it off the
+        SDK sends a plain ``set_weights`` and ``block_time`` is not used (the
+        SDK reads the flag itself, inside ``set_weights``).
 
         The SDK derives the reveal round by predicting the next boundary as
         ``blocks_remaining * block_time`` and then adding a 3-block safety
@@ -471,6 +503,80 @@ class BittensorChain:
         except Exception as e:
             self._consecutive_failures += 1
             logger.warning(f"Could not verify TimelockedWeightCommits: {e}")
+            return None
+
+    async def verify_weights_set(
+        self, since_block: int, uids: list[int], weights: list[int]
+    ) -> dict | None:
+        """Read ``Weights`` back from chain: is OUR plain set_weights there?
+
+        The proof for the commit-reveal-OFF path. A plain ``set_weights``
+        writes two things in its block, and both are checked: the vector in
+        ``Weights[netuid, uid]`` must equal what was submitted, u16 for u16,
+        and ``LastUpdate[uid]`` must be at or after ``since_block``. The
+        second half is what makes this a proof of THIS submit: a re-send of
+        the vector already on chain matches ``Weights`` before it is even
+        sent, and only ``LastUpdate`` moving says the chain accepted it.
+
+        Same three outcomes as ``verify_weight_commit_landed``: landed / not
+        landed / ``None`` when the chain could not be read.
+        """
+        try:
+            async with self._subtensor_lock:
+                await self._maybe_reconnect()
+                uid_res = self.subtensor.substrate.query(
+                    "SubtensorModule", "Uids", [self.netuid, self.hotkey.ss58_address]
+                )
+                if asyncio.iscoroutine(uid_res):
+                    uid_res = await uid_res
+                uid_value = getattr(uid_res, "value", uid_res)
+                if uid_value is None:
+                    logger.warning("Own uid not found on chain; cannot verify weights")
+                    return None
+                uid = int(uid_value)
+                weights_res = self.subtensor.substrate.query(
+                    "SubtensorModule", "Weights", [self.netuid, uid]
+                )
+                if asyncio.iscoroutine(weights_res):
+                    weights_res = await weights_res
+                last_update_res = self.subtensor.substrate.query(
+                    "SubtensorModule", "LastUpdate", [self.netuid]
+                )
+                if asyncio.iscoroutine(last_update_res):
+                    last_update_res = await last_update_res
+            on_chain = getattr(weights_res, "value", weights_res) or []
+            on_chain = sorted((int(d), int(w)) for d, w in on_chain)
+            submitted = sorted((int(d), int(w)) for d, w in zip(uids, weights))
+            last_update_all = getattr(last_update_res, "value", last_update_res) or []
+            last_update = (
+                int(last_update_all[uid]) if uid < len(last_update_all) else None
+            )
+            self._consecutive_failures = 0
+            if last_update is not None and last_update >= since_block:
+                if on_chain == submitted:
+                    return {
+                        "landed": True,
+                        "set_block": last_update,
+                        "uid": uid,
+                        "n": len(on_chain),
+                    }
+                # The chain accepted a set of ours since the submit but holds
+                # a different vector: say exactly how it differs, because the
+                # retry this triggers will most likely be rate-limited and
+                # the operator needs to know what is actually on chain.
+                logger.error(
+                    f"Weights on chain (LastUpdate={last_update}) differ from the "
+                    f"vector submitted: on_chain={on_chain} submitted={submitted}"
+                )
+            return {
+                "landed": False,
+                "since_block": since_block,
+                "last_update": last_update,
+                "matches": on_chain == submitted,
+            }
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.warning(f"Could not verify Weights on chain: {e}")
             return None
 
     @staticmethod

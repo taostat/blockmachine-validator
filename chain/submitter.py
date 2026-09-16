@@ -18,11 +18,12 @@ _VERIFY_DELAY_SECS = 12.0
 class WeightSubmitter:
     def __init__(self, chain: ChainInterface, weights_config: WeightConfig):
         self.chain = chain
-        # The block the last verified commit was INCLUDED at, straight from
-        # the storage read that proved it. Not the block we finished
-        # verifying at: verification polls for up to a minute, so those two
-        # can sit on opposite sides of an epoch boundary, and the caller
-        # dedupes commits per epoch off this value.
+        # The block the last verified submission (a commit, or with
+        # commit-reveal off a plain set) was INCLUDED at, straight from the
+        # storage read that proved it. Not the block we finished verifying
+        # at: verification polls for up to a minute, so those two can sit on
+        # opposite sides of an epoch boundary, and the caller dedupes
+        # submissions per epoch off this value.
         self.last_commit_block: int | None = None
         # Held by reference so registry-driven hot-reloads of burn_sink_uid
         # take effect on the next submit() without a process restart.
@@ -38,7 +39,8 @@ class WeightSubmitter:
 
         ``block_time`` steers which drand round the commit targets; the
         caller recomputes it per attempt from the remaining runway. ``None``
-        leaves the SDK's default, which aims past the boundary.
+        leaves the SDK's default, which aims past the boundary. With
+        commit-reveal off there is no round to target and it is not passed.
         """
         burn_sink_uid = self._weights.burn_sink_uid
         all_weights = list(miner_weights)
@@ -58,6 +60,15 @@ class WeightSubmitter:
         for uid, w in zip(uids, values):
             label = " (burn)" if uid == burn_sink_uid else ""
             logger.info(f"  UID {uid}: {w}{label}")
+
+        # Read BEFORE the submit, because it decides what "landed" means
+        # below: a timelocked commit is proved from the commit queue and a
+        # plain set from `Weights` itself, and each proof reads storage the
+        # other path never writes. The SDK reads the same flag inside
+        # `set_weights` to pick the extrinsic.
+        commit_reveal = await self._commit_reveal_enabled()
+        if not commit_reveal:
+            block_time = None
 
         try:
             # Captured BEFORE the submit so the chain read below answers
@@ -92,7 +103,12 @@ class WeightSubmitter:
         # identical-content vectors, of which the last-decrypted wins.
         attempts = _VERIFY_ATTEMPTS if claimed else 2
         self.last_commit_block = None
-        verified = await self._commit_landed_on_chain(since_block, attempts)
+        if commit_reveal:
+            verified = await self._commit_landed_on_chain(since_block, attempts)
+        else:
+            verified = await self._weights_set_on_chain(
+                since_block, uids, values, attempts
+            )
         if verified and self.last_commit_block is None:
             # Verified but the proof carried no block: fall back to the block
             # sampled BEFORE the submit, which is never later than inclusion.
@@ -103,7 +119,7 @@ class WeightSubmitter:
         if verified:
             if not claimed:
                 logger.warning(
-                    "SDK reported a rejection but the commit IS on chain — "
+                    "SDK reported a rejection but the submission IS on chain — "
                     "trusting storage over the SDK"
                 )
             logger.info("Weights submitted successfully")
@@ -140,6 +156,73 @@ class WeightSubmitter:
         return await self.submit(
             [(int(uid), float(w)) for uid, w in vector], 0.0, block_time=block_time
         )
+
+    async def _commit_reveal_enabled(self) -> bool:
+        """Is this subnet on commit-reveal? Unreadable means YES.
+
+        The commit path is the one every deployed validator has run for
+        months; the plain-set path is only taken on a definite "off" from
+        the chain. A chain that predates the read (or a test double without
+        it) is treated the same way.
+        """
+        getter = getattr(self.chain, "commit_reveal_enabled", None)
+        if getter is None:
+            return True
+        try:
+            enabled = await getter()
+        except Exception as e:
+            logger.warning(f"Could not read the commit-reveal flag: {e}")
+            return True
+        if enabled is None:
+            logger.warning(
+                "Commit-reveal flag unreadable — assuming ON (commit path)"
+            )
+            return True
+        return bool(enabled)
+
+    async def _weights_set_on_chain(
+        self, since_block: int, uids: list[int], values: list[int], attempts: int
+    ) -> bool:
+        """The commit-reveal-OFF proof: `Weights` holds the vector we just
+        sent and `LastUpdate` moved to this submit. Same polling shape as
+        the commit proof; the SDK waited for finalization, so the first
+        read normally already sees it."""
+        could_not_read = 0
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(_VERIFY_DELAY_SECS)
+            try:
+                proof = await self.chain.verify_weights_set(since_block, uids, values)
+            except Exception as e:
+                logger.warning(f"Weights verification raised: {e}")
+                proof = None
+            if not isinstance(proof, dict):
+                could_not_read += 1
+                continue
+            if proof.get("landed"):
+                set_block = proof.get("set_block")
+                self.last_commit_block = (
+                    int(set_block) if set_block is not None else None
+                )
+                logger.info(
+                    f"Weights verified on chain: uid={proof.get('uid')} "
+                    f"block={set_block} entries={proof.get('n')}"
+                )
+                return True
+        if could_not_read == attempts:
+            logger.error(
+                "Could not read the chain to verify the weights — treating "
+                "as NOT submitted (fail-closed). A duplicate retry is "
+                "harmless: the chain's rate limit rejects it if the "
+                "original landed."
+            )
+        else:
+            logger.error(
+                f"SDK claimed success but Weights on chain do not show a set "
+                f"of ours since block {since_block} — treating as NOT "
+                "submitted so the epoch stays unprocessed and is retried."
+            )
+        return False
 
     async def _commit_landed_on_chain(self, since_block: int, attempts: int) -> bool:
         could_not_read = 0
