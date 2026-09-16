@@ -184,6 +184,13 @@ INFO - Verification PASS: state_getStorage (chain=TAO)
 INFO - [verification] epoch 7668894 complete
 ```
 
+The validator follows the subnet's commit-reveal setting on its own. With
+commit-reveal on it commits a timelocked vector near the end of the chain
+epoch and you will see `Commit verified on chain`. With commit-reveal off it
+sets weights as soon as the epoch is finalized and proves it by reading the
+vector back: `Weights verified on chain: uid=... block=... entries=...`.
+Nothing to configure either way; the chain is read every time.
+
 ### Warning signs
 
 | Log message | Meaning | Action |
