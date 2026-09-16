@@ -20,16 +20,11 @@ jobs:
         id: env
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            REF="${GITHUB_REF#refs/tags/}"
-            if [[ "$REF" == *-dev ]]; then
-              echo "overlays=testnet" >> "$GITHUB_OUTPUT"
-            else
-              echo "overlays=testnet mainnet" >> "$GITHUB_OUTPUT"
-            fi
-            echo "tag=$REF" >> "$GITHUB_OUTPUT"
+            echo "overlays=mainnet" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            # Branch push — deploy to testnet only, tag with commit SHA
-            echo "overlays=testnet" >> "$GITHUB_OUTPUT"
+            # Branch push — build and push the image tagged with the commit
+            # SHA; there is no environment to deploy it to (see below).
             echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
           fi
 
@@ -56,6 +51,8 @@ jobs:
           cache-to: type=registry,ref=quay.io/taostats/blockmachine-validator:buildcache,mode=max
 
       - name: Trigger deployment
+        # Only tags deploy. Branch pushes build the image and stop here.
+        if: github.ref_type == 'tag'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
         with:
           token: ${{ secrets.GH_PAT }}
