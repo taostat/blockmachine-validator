@@ -2,7 +2,7 @@
 
 ## Overview
 
-Blockmachine (Subnet 19) is a decentralized marketplace for blockchain RPC infrastructure. Validators independently audit miner performance by reading gateway logs from public storage, verifying response correctness against reference nodes, computing quality-weighted scores, and submitting weights on-chain each epoch (361 blocks, ~72 minutes).
+Blockmachine (Subnet 19) is a decentralized marketplace for blockchain RPC infrastructure. Validators independently audit miner performance by reading gateway logs from public storage, verifying response correctness against reference nodes, computing quality-weighted scores, and submitting weights on-chain each epoch (7,200 blocks, ~24 hours).
 
 ---
 
@@ -169,19 +169,21 @@ INFO - Validator initialized — starting weight loop + verification loop
 Within a few minutes the weight loop should pick up an epoch and submit weights:
 
 ```
-INFO - Processing epoch 7668894 for weights
+INFO - Processing epoch 9075361 for weights
 INFO - Metagraph synced: 12 miners
 INFO - Alpha price: $2.9260
 INFO - Weights submitted successfully
-INFO - Epoch 7668894 done — paid 4 miners, burn=95.2%, submitted=True
+INFO - Epoch 9075361 done — α=$2.9260, consumed=$41.203117, paid 4 miners, burn=0.0%, submitted=True
 ```
+
+`burn=0.0%` is the normal result: the miner pool is paid out in full every epoch (see [Architecture](#9-architecture)). A non-zero burn is the exception, not the norm.
 
 And the verification loop should be checking sampled queries:
 
 ```
-INFO - [verification] processing epoch 7668894
+INFO - [verification] processing epoch 9075361
 INFO - Verification PASS: state_getStorage (chain=TAO)
-INFO - [verification] epoch 7668894 complete
+INFO - [verification] epoch 9075361 complete
 ```
 
 The validator follows the subnet's commit-reveal setting on its own. With
@@ -197,7 +199,7 @@ Nothing to configure either way; the chain is read every time.
 |---|---|---|
 | `Failed to fetch validator config from registry` | Registry unreachable at startup — falling back to defaults | Check `REGISTRY_URL` and network connectivity |
 | `set_weights rejected` | Chain rejected the submission | Check stake, registration, rate limits |
-| `No CU allocations for epoch X` | No gateway traffic for that epoch | Normal for quiet periods; the validator will burn after a retry window |
+| `No CU allocations for X` | The traffic logs for that epoch could not be read | The validator retries for a while, then re-sends its previous weight vector rather than burning |
 | `Verification FAIL` | A miner returned incorrect data | Automatic — miner gets banned |
 | `Token expired, attempting refresh` | Gateway auth token expired | Automatic — the validator re-runs the hotkey challenge flow |
 
@@ -236,7 +238,7 @@ Use the corresponding `.env.example.*` file. `NETUID`, `SUBTENSOR_NETWORK`, `REG
 You miss weight submissions for the epochs you're offline. Prolonged downtime reduces your validator's effective influence.
 
 **What is the burn sink?**
-A UID (set by the registry) that receives the portion of emissions miners didn't earn through actual work. If miners consumed $50 of a $500 emission pool, the remaining $450 goes to burn.
+A UID (set by the registry) that receives any part of the miner pool that is not paid out. In normal operation that is nothing: the whole pool is distributed to miners in proportion to the work they served. An epoch with no gateway traffic at all is burned in full.
 
 ---
 
@@ -252,7 +254,7 @@ A UID (set by the registry) that receives the portion of emissions miners didn't
 7. Bittensor consensus aggregates validator weights → emissions distributed
 ```
 
-**Weight formula:** each miner's weight is proportional to `CU_served × target_usd_per_cu`, bounded by 41% of total subnet emissions. If total miner asks exceed the pool, payouts scale down proportionally. Unearned emissions go to the burn sink.
+**Weight formula:** each miner's weight is proportional to `CU_served × target_usd_per_cu`, as a share of the miner pool (41% of subnet emissions). The pool is paid out in full every epoch, so the burn is zero in normal operation. An epoch with no gateway traffic at all is burned in full.
 
 **Verification:** a confirmed hash mismatch (miner response ≠ reference response at the same block) results in a permanent coldkey ban.
 
