@@ -15,7 +15,7 @@ bittensor-drand==2.0.0
 bittensor-wallet==4.1.1
 boto3==1.42.86
 botocore==1.42.86
-certifi==2026.2.25
+certifi==2026.10.19
 charset-normalizer==3.4.7
 click==8.3.2
 colorama==0.4.6
