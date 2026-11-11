@@ -24,6 +24,7 @@ from validator.weights.types import normalize_miner_config
 logger = logging.getLogger(__name__)
 
 _CU_RETRY_TIMEOUT = 1800  # 30 min
+_MISSING_EPOCH_FALLBACK_AFTER_BLOCKS = 7100
 
 # The SDK adds this many blocks to its predicted boundary before choosing a
 # drand round (`SECURITY_BLOCK_OFFSET` in bittensor's weight extrinsic). It is
@@ -137,6 +138,7 @@ class WeightLoop:
         self._session_commits: dict[str, dict] = {}
         self._commits_initialized = False
         self._reveal_offset_blocks: int | None = None
+        self._fallback_attempted_epoch_block: int | None = None
 
     async def run(self):
         self.running = True
@@ -254,10 +256,73 @@ class WeightLoop:
             logger.info(
                 "No unprocessed epochs found — waiting for next epoch to finalize"
             )
+            await self._resubmit_previous_if_weights_missing()
             return
 
         epoch_id, miner_configs, manifest, price_snapshot = latest
         await self._process_epoch(epoch_id, miner_configs, manifest, price_snapshot)
+
+    async def _resubmit_previous_if_weights_missing(self) -> bool:
+        """Keep LastUpdate fresh if finalization misses most of this epoch.
+
+        This is deliberately a late fallback: a finalized epoch always takes
+        the normal processing path above, and the previous vector is only
+        re-sent after 7,100 blocks with no weight update in the current chain
+        epoch. The fallback does not arm ``_last_submitted_block`` so a late
+        finalizer can still submit its actual weights in this epoch.
+        """
+        sched = await self._schedule()
+        if sched is None:
+            return False
+
+        current_block, _tempo, epoch_start = sched
+        blocks_into_epoch = current_block - epoch_start
+        if blocks_into_epoch < _MISSING_EPOCH_FALLBACK_AFTER_BLOCKS:
+            return False
+
+        if self._fallback_attempted_epoch_block == epoch_start:
+            logger.debug(
+                f"Chain epoch {epoch_start}: previous-weight fallback already attempted"
+            )
+            return False
+
+        getter = getattr(self.chain, "get_validator_last_update_block", None)
+        if getter is None:
+            logger.warning(
+                "Cannot check whether weights were set this chain epoch; "
+                "skipping previous-weight fallback"
+            )
+            return False
+        try:
+            last_update_block = await getter()
+        except Exception as e:
+            logger.warning(
+                f"Could not read validator LastUpdate ({e}); "
+                "skipping previous-weight fallback"
+            )
+            return False
+        if last_update_block is None:
+            logger.warning(
+                "Validator LastUpdate is unavailable; "
+                "skipping previous-weight fallback"
+            )
+            return False
+        if last_update_block >= epoch_start:
+            logger.info(
+                f"Chain epoch {epoch_start}: weights already set at block "
+                f"{last_update_block}; no fallback needed"
+            )
+            return False
+
+        # Set before attempting the chain operation: even a failed submit or
+        # an unreadable prior vector must not cause repeated fallback submits
+        # during this epoch.
+        self._fallback_attempted_epoch_block = epoch_start
+        logger.warning(
+            f"No weights set in chain epoch {epoch_start} after "
+            f"{blocks_into_epoch} blocks — re-sending the previous vector"
+        )
+        return await self._resend_previous_weights(f"chain-{epoch_start}")
 
     async def _schedule(self) -> "tuple[int, int, int] | None":
         """``(current_block, tempo, last_epoch_block)`` from the chain's own
