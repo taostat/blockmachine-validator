@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 
 from validator.common.types import MinerInfo
 from validator.config import ValidatorConfig
+from validator.weights import loop as weights_loop_module
 from validator.weights.loop import WeightLoop
 
 TEMPO = 7200
@@ -89,9 +90,16 @@ def make_loop(*, blocks_into_epoch, last_update_block):
         chain.last_update_block = chain.current_block
         return True
 
+    async def rate_limited_submit(miner_weights, burn_weight, block_time=None):
+        if chain.current_block - chain.last_update_block < 100:
+            return False
+        chain.last_update_block = chain.current_block
+        return True
+
     submitter = types.SimpleNamespace(
         resubmit_previous=AsyncMock(side_effect=successful_resubmit),
-        submit=AsyncMock(return_value=True),
+        submit=AsyncMock(side_effect=rate_limited_submit),
+        blocks_until_next_epoch=AsyncMock(return_value=100),
         last_commit_block=None,
     )
     loop = WeightLoop(
@@ -209,7 +217,13 @@ def test_rejected_resend_is_retried_on_a_later_tick():
     assert loop._fallback_completed_epoch_block == EPOCH_START
 
 
-def test_late_finalized_epoch_still_uses_normal_processing_after_fallback():
+def test_rate_limited_late_finalizer_stays_unprocessed_until_a_later_success(
+    monkeypatch,
+):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(weights_loop_module.asyncio, "sleep", no_sleep)
     loop = make_loop(
         blocks_into_epoch=FALLBACK_BLOCK,
         last_update_block=EPOCH_START - 1,
@@ -231,7 +245,16 @@ def test_late_finalized_epoch_still_uses_normal_processing_after_fallback():
     run(loop._tick())
 
     loop.submitter.resubmit_previous.assert_awaited_once()
-    loop.submitter.submit.assert_awaited_once()
+    assert loop.submitter.submit.await_count == 3
+    loop.store.mark_epoch_processed.assert_not_awaited()
+    loop.store.save_epoch_audit.assert_not_awaited()
+    assert loop._last_submitted_block is None
+
+    loop.chain.epoch_start += TEMPO
+    loop.chain.current_block = loop.chain.epoch_start + FALLBACK_BLOCK
+    run(loop._tick())
+
+    assert loop.submitter.submit.await_count == 4
     loop.store.mark_epoch_processed.assert_awaited_once_with(
         "late-finalized-epoch", weights_submitted=True
     )
